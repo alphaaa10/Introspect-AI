@@ -1,9 +1,18 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { LogoIcon } from './Icons';
 import { UploadCloud, Database, ShieldAlert, FileText, Share2, Server, Network, UserX } from 'lucide-react';
 
-export default function SetupScreen({ onComplete }) {
-  const [mode, setMode] = useState(null); // 'select-dataset' or 'upload' or null
+export default function SetupScreen({ onComplete, initialMode = null }) {
+  const [mode, setMode] = useState(initialMode);
+  const [showOfflineToast, setShowOfflineToast] = useState(false);
+
+  useEffect(() => {
+    if (mode === 'upload') {
+      setShowOfflineToast(true);
+      const timer = setTimeout(() => setShowOfflineToast(false), 4000);
+      return () => clearTimeout(timer);
+    }
+  }, [mode]);
 
   const handleDatasetSelect = (datasetKey) => {
     onComplete(datasetKey);
@@ -16,6 +25,12 @@ export default function SetupScreen({ onComplete }) {
   if (mode === 'upload') {
     return (
       <div className="setup-container">
+        {showOfflineToast && (
+          <div className="offline-toast" style={{ top: 20, position: 'absolute' }}>
+            <ShieldAlert size={14} />
+            This feature is unavailable in offline / simulation mode
+          </div>
+        )}
         <div className="setup-logo" style={{ marginBottom: 'var(--space-6)' }}>
           <div className="setup-logo-icon" style={{ width: 48, height: 48 }}>
             <LogoIcon size={24} />

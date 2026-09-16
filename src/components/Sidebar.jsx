@@ -1,17 +1,20 @@
-import { 
-  Activity, 
-  Network, 
-  Radar, 
-  ShieldAlert, 
+import {
+  Activity,
+  Network,
+  Radar,
+  ShieldAlert,
   BookOpen,
-  Settings, 
-  LogOut, 
-  PanelLeftClose, 
+  PanelLeftClose,
   PanelLeftOpen,
   Cpu,
   LayoutDashboard,
-  TrendingUp
+  TrendingUp,
+  Menu,
+  X,
+  Search
 } from 'lucide-react';
+
+import { useState } from 'react';
 
 const mainNavItems = [
   { icon: LayoutDashboard, label: 'Overview', id: 'Overview' },
@@ -23,19 +26,41 @@ const mainNavItems = [
   { icon: Cpu, label: 'AI Pipeline', id: 'Pipeline' },
 ];
 
-export default function Sidebar({ collapsed, onToggle, activeView, onViewChange }) {
+export default function Sidebar({ collapsed, onToggle, activeView, onViewChange, mobileNavOpen, setMobileNavOpen, onHome }) {
+  const [showOfflineToast, setShowOfflineToast] = useState(false);
+
+  const handleSearchClick = () => {
+    setShowOfflineToast(true);
+    setTimeout(() => setShowOfflineToast(false), 3000);
+  };
+
   return (
-    <aside className={`sidebar ${collapsed ? 'collapsed' : ''}`}>
+    <aside className={`sidebar ${collapsed ? 'collapsed' : ''} ${mobileNavOpen ? 'mobile-open' : ''}`}>
+      {showOfflineToast && (
+        <div className="offline-toast">
+          <Search size={14} />
+          Search is unavailable in offline / simulation view
+        </div>
+      )}
+      
       <div className="sidebar-header">
-        <a href="#" className="sidebar-logo">
+        <a href="#" className="sidebar-logo" onClick={(e) => { e.preventDefault(); onHome?.(); }}>
           <div className="sidebar-logo-icon">
-            <Cpu size={20} />
+            <Cpu size={18} />
           </div>
           <span className="sidebar-logo-text">Introspect AI</span>
         </a>
-        <button className="sidebar-toggle-btn" onClick={onToggle}>
+        <button className="sidebar-toggle-btn desktop-only" onClick={onToggle} title={collapsed ? 'Expand' : 'Collapse'}>
           {collapsed ? <PanelLeftOpen size={18} /> : <PanelLeftClose size={18} />}
         </button>
+        <div className="mobile-header-actions">
+          <button className="mobile-search-btn" onClick={handleSearchClick} title="Search">
+            <Search size={18} />
+          </button>
+          <button className="mobile-menu-btn" onClick={() => setMobileNavOpen(!mobileNavOpen)}>
+            {mobileNavOpen ? <X size={20} /> : <Menu size={20} />}
+          </button>
+        </div>
       </div>
 
       <nav className="sidebar-nav">
@@ -46,22 +71,11 @@ export default function Sidebar({ collapsed, onToggle, activeView, onViewChange 
             onClick={() => onViewChange(item.id)}
             title={collapsed ? item.label : undefined}
           >
-            <item.icon size={20} strokeWidth={activeView === item.id ? 2.5 : 2} />
+            <item.icon size={18} strokeWidth={activeView === item.id ? 2.5 : 2} />
             <span>{item.label}</span>
           </div>
         ))}
       </nav>
-
-      <div style={{ padding: 'var(--space-4) 0', borderTop: '1px solid var(--surface-divider)' }}>
-        <div className="sidebar-item" title={collapsed ? "Settings" : undefined}>
-          <Settings size={20} />
-          <span>Settings</span>
-        </div>
-        <div className="sidebar-item" title={collapsed ? "Log Out" : undefined} style={{ color: 'var(--severity-critical)' }}>
-          <LogOut size={20} />
-          <span>Log Out</span>
-        </div>
-      </div>
     </aside>
   );
 }

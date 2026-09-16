@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, useContext } from 'react';
 import ReactFlow, { 
   Background, 
   MarkerType, 
@@ -7,11 +7,12 @@ import ReactFlow, {
 } from 'reactflow';
 import 'reactflow/dist/style.css';
 import { Database, Network, Cpu, BrainCircuit, Search, Split, FileText } from 'lucide-react';
+import { ScenarioContext } from '../App';
 
 const PipelineNode = ({ data }) => {
   return (
     <div style={{
-      background: 'white',
+      background: 'var(--bg-secondary)',
       border: `2px solid ${data.color || 'var(--surface-border)'}`,
       borderRadius: 'var(--radius-lg)',
       padding: 'var(--space-3) var(--space-4)',
@@ -71,24 +72,29 @@ const initialEdges = [
 ];
 
 export default function PipelineVisualization() {
+  const { theme } = useContext(ScenarioContext);
+
   return (
-    <div style={{ width: '100%', height: '100%', background: 'var(--bg-primary)' }}>
-      <ReactFlow
-        nodes={initialNodes}
-        edges={initialEdges}
-        nodeTypes={nodeTypes}
-        fitView
-        fitViewOptions={{ padding: 0.2 }}
-        attributionPosition="bottom-right"
-        edgesUpdatable={false}
-        nodesDraggable={false}
-        nodesConnectable={false}
-        elementsSelectable={false}
-      >
-        <Background color="#cbd5e1" gap={20} size={1} />
-      </ReactFlow>
+    <div style={{ width: '100%', flex: 1, minHeight: 400, background: 'var(--bg-primary)', position: 'relative' }}>
+      <div style={{ position: 'absolute', inset: 0 }}>
+        <ReactFlow
+          nodes={initialNodes}
+          edges={initialEdges}
+          nodeTypes={nodeTypes}
+          fitView
+          fitViewOptions={{ padding: 0.2 }}
+          attributionPosition="bottom-right"
+          edgesUpdatable={false}
+          nodesDraggable={false}
+          nodesConnectable={false}
+          elementsSelectable={false}
+          proOptions={{ hideAttribution: true }}
+        >
+          <Background color={theme === 'dark' ? '#334155' : '#cbd5e1'} gap={20} size={1} />
+        </ReactFlow>
+      </div>
       
-      <div style={{ position: 'absolute', bottom: 24, left: 24, background: 'white', padding: '16px', borderRadius: '8px', boxShadow: 'var(--shadow-lg)', maxWidth: 350, border: '1px solid var(--surface-border)' }}>
+      <div style={{ position: 'absolute', bottom: 24, left: 24, background: 'var(--bg-secondary)', padding: '16px', borderRadius: '8px', boxShadow: 'var(--shadow-lg)', maxWidth: 350, border: '1px solid var(--surface-border)' }}>
         <h4 style={{ fontSize: '12px', fontWeight: 700, marginBottom: '8px', color: 'var(--text-primary)' }}>How It Works</h4>
         <p style={{ fontSize: '11px', color: 'var(--text-secondary)', lineHeight: 1.5 }}>
           The <strong>World Model</strong> (Top Path) predicts network state evolution. If danger is predicted, it sends a Focus Signal to the <strong>Correlation Engine</strong> (Bottom Path) to instantly hunt for hard evidence. The <strong>Fusion Layer</strong> calibrates the prediction based on evidence before the LLM generates a grounded narrative.
