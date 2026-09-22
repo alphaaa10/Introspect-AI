@@ -176,61 +176,70 @@ def evaluate(model, sequences, targets):
     return compute_metrics(y_true_attack, y_pred_attack_probs, y_true_mitre, y_pred_mitre)
 
 def run_pipeline(
-    csv_path: Path, 
+    csv_paths: list[Path], 
     is_smoke: bool = False,
-    epochs: int = 30
-) -> tuple[WorldModel, dict, list, dict, str]:
+    epochs: int = 30,
+    save_path: str = None,
+    resume_from: str = None
+) -> tuple[WorldModel, dict, list, dict, dict]:
     """
     End-to-end data ingestion, sequence building, and model training.
     """
-    filepath = csv_path
     logger.info(f"Setting global seed to {config.GLOBAL_SEED}")
     set_seed(config.GLOBAL_SEED)
     
-    logger.info(f"Parsing CSV: {filepath}")
-    if is_smoke:
-        events, errors = parse_csv(filepath, source=DataSource.MOCK)
-    else:
-        events, errors = parse_cicids2017_csv(filepath, source=DataSource.REAL)
-        
-    logger.info(f"Parsed {len(events)} valid events, {len(errors)} errors skipped.")
-    if not events:
-        logger.error("No valid events parsed. Aborting.")
-        return None
-        
-    logger.info("Windowing and extracting features...")
-    feature_records = window_and_extract(events)
-    logger.info(f"Generated {len(feature_records)} windows.")
-    
-    logger.info("Building graphs...")
-    windows = []
-    for fr in feature_records:
-        gw = build_graph(events, fr.window_id, fr.window_start, fr.window_end, fr.source)
-        windows.append(gw)
-        
-    logger.info("Creating sequences...")
-    # Fix: Split windows into contiguous chunks based on timestamp to avoid sequences straddling time gaps
-    chunks = []
-    current_chunk = []
-    
-    for w in windows:
-        if not current_chunk:
-            current_chunk.append(w)
+    all_chunks = []
+    all_events_combined = []
+
+    for filepath in csv_paths:
+        logger.info(f"Parsing CSV: {filepath}")
+        if is_smoke:
+            events, errors = parse_csv(filepath, source=DataSource.MOCK)
         else:
-            # Check if this window directly follows the previous one in time
-            prev_w = current_chunk[-1]
-            if w.window_start == prev_w.window_end:
+            events, errors = parse_cicids2017_csv(filepath, source=DataSource.REAL)
+            
+        logger.info(f"Parsed {len(events)} valid events, {len(errors)} errors skipped.")
+        if not events:
+            continue
+            
+        logger.info("Windowing and extracting features...")
+        feature_records = window_and_extract(events)
+        logger.info(f"Generated {len(feature_records)} windows.")
+        
+        logger.info("Building graphs...")
+        windows = []
+        for fr in feature_records:
+            gw = build_graph(events, fr.window_id, fr.window_start, fr.window_end, fr.source)
+            windows.append(gw)
+            
+        # Split windows into contiguous chunks based on timestamp
+        chunks = []
+        current_chunk = []
+        for w in windows:
+            if not current_chunk:
                 current_chunk.append(w)
             else:
-                chunks.append(current_chunk)
-                current_chunk = [w]
-    if current_chunk:
-        chunks.append(current_chunk)
-        
+                prev_w = current_chunk[-1]
+                if w.window_start == prev_w.window_end:
+                    current_chunk.append(w)
+                else:
+                    chunks.append(current_chunk)
+                    current_chunk = [w]
+        if current_chunk:
+            chunks.append(current_chunk)
+            
+        all_chunks.extend(chunks)
+        all_events_combined.extend(events)
+
+    if not all_chunks:
+        logger.error("No valid events parsed. Aborting.")
+        return None
+
+    logger.info("Creating sequences...")
     all_seqs = []
     all_targets = []
-    for chunk in chunks:
-        chunk_seqs, chunk_targets = create_sequences(chunk, events)
+    for chunk in all_chunks:
+        chunk_seqs, chunk_targets = create_sequences(chunk, all_events_combined)
         all_seqs.extend(chunk_seqs)
         all_targets.extend(chunk_targets)
     
@@ -292,7 +301,7 @@ def run_pipeline(
     model_args = dict(
         node_in_dim=len(NODE_FEATURE_NAMES),
         edge_in_dim=len(EDGE_FEATURE_NAMES),
-        gat_hidden_dim=16,
+        gat_hidden_dim=config.GAT_HIDDEN_DIM,
         gat_num_heads=2,
         gat_out_dim=8,
         gat_dropout=0.0,
@@ -303,7 +312,7 @@ def run_pipeline(
     )
     model = WorldModel(**model_args)
     
-    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    optimizer = optim.Adam(model.parameters(), lr=3e-4)
     
     num_attacks = sum(1 for t in train_targets if t[0] == 1)
     num_benign = len(train_targets) - num_attacks
@@ -316,10 +325,22 @@ def run_pipeline(
     attack_criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     mitre_criterion = nn.CrossEntropyLoss()
     
+    if resume_from:
+        logger.info(f"Resuming from checkpoint: {resume_from}")
+        model.load_state_dict(torch.load(resume_from, weights_only=True))
+    
     logger.info("Starting training...")
     for epoch in range(1, epochs + 1):
         loss = train_one_epoch(model, optimizer, train_seqs, train_targets, attack_criterion, mitre_criterion)
         logger.info(f"Epoch {epoch}/{epochs} - Loss: {loss:.4f}")
+        
+        # Incremental saving
+        if save_path and not is_smoke:
+            ckpt_dir = Path(save_path)
+            ckpt_dir.mkdir(exist_ok=True)
+            incremental_pt_path = ckpt_dir / f"sentinel_epoch_{epoch}.pt"
+            torch.save(model.state_dict(), incremental_pt_path)
+            logger.info(f"Saved incremental checkpoint to {incremental_pt_path}")
         
     logger.info("Evaluating on Train set:")
     train_metrics = evaluate(model, train_seqs, train_targets)
@@ -343,22 +364,26 @@ def main():
     parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs")
     parser.add_argument("--patience", type=int, default=3, help="Early stopping patience")
     parser.add_argument("--save-path", type=str, default="checkpoints", help="Directory to save model checkpoints")
+    parser.add_argument("--resume-from", type=str, default=None, help="Path to checkpoint file to resume from")
     parser.add_argument("--dry-run", action="store_true", help="Print label distribution and exit before training")
     args = parser.parse_args()
     
     global dry_run
     dry_run = args.dry_run
     
-    # Path to real data slice
-    csv_path = "data/raw/friday_plus_slice_mixed.csv"
+    # Paths to real data slices
+    csv_paths = [
+        Path("data/raw/wednesday_plus_slice.csv"),
+        Path("data/raw/friday_plus_slice_mixed.csv")
+    ]
     
     if args.smoke:
         logger.info("=== RUNNING SMOKE TEST (Pass 1) ===")
-        filepath = Path("data/samples/mock_cicids.csv")
-        model1, model_args, train_seqs, train_metrics1, _ = run_pipeline(filepath, is_smoke=True, epochs=args.epochs)
+        filepaths = [Path("data/samples/mock_cicids.csv")]
+        model1, model_args, train_seqs, train_metrics1, _ = run_pipeline(filepaths, is_smoke=True, epochs=args.epochs)
         
         logger.info("\n=== RUNNING SMOKE TEST (Pass 2 - Determinism Check) ===")
-        model2, _, _, train_metrics2, _ = run_pipeline(filepath, is_smoke=True)
+        model2, _, _, train_metrics2, _ = run_pipeline(filepaths, is_smoke=True)
         
         logger.info("\n=== DETERMINISM RESULTS ===")
         # Check if model1 and model2 produced identical metrics
@@ -426,9 +451,10 @@ def main():
             logger.error("Reload check FAILED.")
             
     else:
-        logger.info("Running real data pipeline (friday_plus_slice_mixed.csv)...")
-        filepath = Path(csv_path)
-        model, model_args, train_seqs, train_metrics, test_metrics = run_pipeline(filepath, is_smoke=False, epochs=args.epochs)
+        logger.info("Running real data pipeline with combined slices...")
+        model, model_args, train_seqs, train_metrics, test_metrics = run_pipeline(
+            csv_paths, is_smoke=False, epochs=args.epochs, save_path=args.save_path, resume_from=args.resume_from
+        )
         
         logger.info("\n=== SAVING CHECKPOINT ===")
         ckpt_dir = Path(args.save_path)

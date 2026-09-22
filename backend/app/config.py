@@ -62,6 +62,10 @@ CORS_ORIGINS: list[str] = os.environ.get(
 # via set_seed()'s fallback path: `s = seed if seed is not None else config.GLOBAL_SEED`.
 GLOBAL_SEED: int = 42
 
+# ── Architecture parameters ─────────────────────────────────────
+# Dimensions for the Graph Attention Network encoder
+GAT_HIDDEN_DIM: int = 64
+
 # Recommended maximum sequence length fed to the LSTM encoder.
 # The LSTM itself enforces nothing — this is a contract for upstream callers.
 SEQUENCE_LENGTH: int = 10

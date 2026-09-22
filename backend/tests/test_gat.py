@@ -122,7 +122,7 @@ class TestGATEncoder:
         x, edge_index, edge_attr = window_to_tensors(gw)
         
         out = model(x, edge_index, edge_attr)
-        assert out.shape == (16,)
+        assert out.shape == (32,)
         
         # Check attention weights
         attn = model.latest_attention_weights
@@ -138,7 +138,7 @@ class TestGATEncoder:
         x, edge_index, edge_attr = window_to_tensors(gw)
         
         out = model(x, edge_index, edge_attr)
-        assert out.shape == (16,)
+        assert out.shape == (32,)
         assert torch.all(out == 0.0)
         
         attn = model.latest_attention_weights

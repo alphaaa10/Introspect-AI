@@ -56,6 +56,7 @@ class GATLayer(nn.Module):
         self.W_dst = nn.Linear(node_in_dim, out_dim, bias=False)
         self.W_edge = nn.Linear(edge_in_dim, out_dim, bias=False)
         self.W_val = nn.Linear(node_in_dim, out_dim, bias=False)
+        self.W_self = nn.Linear(node_in_dim, out_dim, bias=False)
         
         # Attention vector
         self.a = nn.Parameter(torch.empty(size=(out_dim, 1)))
@@ -114,10 +115,15 @@ class GATLayer(nn.Module):
 
         # 4. Aggregate values
         z_val = self.W_val(x[src_idx])  # [E, out_dim]
+        # Inject volumetric edge features directly into the message value via addition
+        z_val = z_val + z_edge
         weighted_val = z_val * alpha.unsqueeze(-1)  # [E, out_dim]
 
         out = torch.zeros((num_nodes, self.out_dim), device=x.device, dtype=x.dtype)
         out.scatter_add_(0, dst_idx.unsqueeze(-1).expand(-1, self.out_dim), weighted_val)
+
+        # GraphSAGE-style self-loop fix: Add node's own projected features
+        out = out + self.W_self(x)
 
         return out, alpha.unsqueeze(-1)
 
@@ -183,13 +189,13 @@ class GATEncoder(nn.Module):
         # ---------------------------------------------------------
         # If the graph has 0 nodes, we do not perform matrix ops or
         # torch.mean (which would return NaN). Instead, we return a
-        # zero tensor of shape [output_dim] and an empty attention
+        # zero tensor of shape [output_dim * 2] and an empty attention
         # weight tensor [0, num_heads].
         if num_nodes == 0:
             self.latest_attention_weights = torch.empty(
                 (0, self.num_heads), device=x.device, dtype=x.dtype
             )
-            return torch.zeros(self.output_dim, device=x.device, dtype=x.dtype)
+            return torch.zeros(self.output_dim * 2, device=x.device, dtype=x.dtype)
 
         # 1. Run all attention heads
         head_outs = []
@@ -214,11 +220,11 @@ class GATEncoder(nn.Module):
         # 2. Final projection: [N, hidden_dim] -> [N, output_dim]
         node_embeds = self.out_proj(node_embeds)
 
-        # 3. Graph-Level Readout (Global Mean Pooling)
-        # Note: Global mean pooling weights all nodes equally, regardless
-        # of anomaly signal. This is a documented limitation of the current
-        # architecture (an attention-based or sum-based readout might
-        # better preserve localized anomaly spikes).
-        graph_embedding = torch.mean(node_embeds, dim=0)  # [output_dim]
+        # 3. Graph-Level Readout (Mean + Max Pooling Concatenation)
+        # Note: Concatenating mean and max preserves both the holistic 
+        # graph structure (mean) and localized anomaly spikes (max).
+        mean_pool = torch.mean(node_embeds, dim=0)
+        max_pool = torch.max(node_embeds, dim=0)[0]
+        graph_embedding = torch.cat([mean_pool, max_pool], dim=0)  # [output_dim * 2]
 
         return graph_embedding

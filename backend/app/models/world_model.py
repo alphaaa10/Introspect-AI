@@ -48,7 +48,7 @@ class WorldModel(nn.Module):
         )
         
         self.lstm = LSTMEncoder(
-            input_dim=gat_out_dim,
+            input_dim=gat_out_dim * 2,
             hidden_dim=lstm_hidden_dim,
             num_layers=lstm_num_layers,
             dropout=lstm_dropout,

@@ -13,7 +13,13 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.schemas import DataSource, NetworkEvent, Protocol
-from app.graph.builder import build_graph
+from app.graph.builder import build_graph, _NODE_SCALE_BOUNDS, _EDGE_SCALE_BOUNDS
+
+def sn(val, name):
+    return pytest.approx(val / _NODE_SCALE_BOUNDS[name][1])
+
+def se(val, name):
+    return pytest.approx(val / _EDGE_SCALE_BOUNDS[name][1])
 
 
 _T0 = datetime(2018, 2, 14, 10, 0, 0, tzinfo=timezone.utc)
@@ -86,10 +92,10 @@ class TestGraphBuilder:
 
         # Host 10.0.0.1 is isolated in terms of incoming traffic (degree 1 out, 0 in)
         # Host 10.0.0.3 is isolated in terms of outgoing traffic (degree 0 out, 1 in)
-        assert gw.nodes[0].out_degree == 1
-        assert gw.nodes[0].in_degree == 0
-        assert gw.nodes[2].out_degree == 0
-        assert gw.nodes[2].in_degree == 1
+        assert gw.nodes[0].out_degree == sn(1, "out_degree")
+        assert gw.nodes[0].in_degree == sn(0, "in_degree")
+        assert gw.nodes[2].out_degree == sn(0, "out_degree")
+        assert gw.nodes[2].in_degree == sn(1, "in_degree")
 
     def test_repeated_edge_aggregation(self):
         # 3 events between same (src, dst) pair
@@ -105,25 +111,25 @@ class TestGraphBuilder:
         assert gw.num_edges == 1
         
         edge = gw.edges[0]
-        assert edge.flow_count == 3
-        assert edge.total_fwd_bytes == 600
-        assert edge.total_bwd_bytes == 60
-        assert edge.total_fwd_packets == 12
-        assert edge.total_bwd_packets == 1
-        assert edge.mean_duration_s == 2.0  # (1+2+3)/3
+        assert edge.flow_count == se(3, "flow_count")
+        assert edge.total_fwd_bytes == se(600, "total_fwd_bytes")
+        assert edge.total_bwd_bytes == se(60, "total_bwd_bytes")
+        assert edge.total_fwd_packets == se(12, "total_fwd_packets")
+        assert edge.total_bwd_packets == se(1, "total_bwd_packets")
+        assert edge.mean_duration_s == se(2.0, "mean_duration_s")
 
         # Node features
         n_src = gw.nodes[0]
-        assert n_src.out_bytes == 600
-        assert n_src.in_bytes == 0
-        assert n_src.total_flows == 3
-        assert n_src.out_degree == 1
+        assert n_src.out_bytes == sn(600, "out_bytes")
+        assert n_src.in_bytes == sn(0, "in_bytes")
+        assert n_src.total_flows == sn(3, "total_flows")
+        assert n_src.out_degree == sn(1, "out_degree")
 
         n_dst = gw.nodes[1]
-        assert n_dst.in_bytes == 600
-        assert n_dst.out_bytes == 0
-        assert n_dst.total_flows == 3
-        assert n_dst.in_degree == 1
+        assert n_dst.in_bytes == sn(600, "in_bytes")
+        assert n_dst.out_bytes == sn(0, "out_bytes")
+        assert n_dst.total_flows == sn(3, "total_flows")
+        assert n_dst.in_degree == sn(1, "in_degree")
 
     def test_self_loop_policy(self):
         # A single event where src == dst
@@ -134,16 +140,16 @@ class TestGraphBuilder:
         assert gw.num_edges == 1
         
         node = gw.nodes[0]
-        assert node.out_degree == 1
-        assert node.in_degree == 1
-        assert node.total_flows == 1
-        assert node.out_bytes == 500
-        assert node.in_bytes == 500
+        assert node.out_degree == sn(1, "out_degree")
+        assert node.in_degree == sn(1, "in_degree")
+        assert node.total_flows == sn(1, "total_flows")
+        assert node.out_bytes == sn(500, "out_bytes")
+        assert node.in_bytes == sn(500, "in_bytes")
 
         edge = gw.edges[0]
         assert edge.src_node_index == 0
         assert edge.dst_node_index == 0
-        assert edge.flow_count == 1
+        assert edge.flow_count == se(1, "flow_count")
 
     def test_multiple_windows_independence(self):
         ev1 = [_event("10.0.0.1", "10.0.0.2")]
@@ -182,20 +188,20 @@ class TestGraphBuilder:
         nodeB = gw.nodes[1]
         nodeC = gw.nodes[2]
         
-        assert nodeA.out_bytes == 30   # 10 + 20
-        assert nodeA.in_bytes == 0
-        assert nodeA.total_flows == 2
-        assert nodeA.out_degree == 2
-        assert nodeA.in_degree == 0
+        assert nodeA.out_bytes == sn(30, "out_bytes")   # 10 + 20
+        assert nodeA.in_bytes == sn(0, "in_bytes")
+        assert nodeA.total_flows == sn(2, "total_flows")
+        assert nodeA.out_degree == sn(2, "out_degree")
+        assert nodeA.in_degree == sn(0, "in_degree")
 
-        assert nodeB.out_bytes == 30   # 30
-        assert nodeB.in_bytes == 10    # 10 from A
-        assert nodeB.total_flows == 2
-        assert nodeB.out_degree == 1
-        assert nodeB.in_degree == 1
+        assert nodeB.out_bytes == sn(30, "out_bytes")   # 30
+        assert nodeB.in_bytes == sn(10, "in_bytes")    # 10 from A
+        assert nodeB.total_flows == sn(2, "total_flows")
+        assert nodeB.out_degree == sn(1, "out_degree")
+        assert nodeB.in_degree == sn(1, "in_degree")
 
-        assert nodeC.out_bytes == 0
-        assert nodeC.in_bytes == 50    # 20 from A, 30 from B
-        assert nodeC.total_flows == 2
-        assert nodeC.out_degree == 0
-        assert nodeC.in_degree == 2
+        assert nodeC.out_bytes == sn(0, "out_bytes")
+        assert nodeC.in_bytes == sn(50, "in_bytes")    # 20 from A, 30 from B
+        assert nodeC.total_flows == sn(2, "total_flows")
+        assert nodeC.out_degree == sn(0, "out_degree")
+        assert nodeC.in_degree == sn(2, "in_degree")
