@@ -18,12 +18,8 @@ import torch.nn.functional as F
 from app import config
 
 
-def set_seed(seed: int | None = None) -> None:
-    """Explicit determinism mechanism. Call before model instantiation."""
-    s = seed if seed is not None else config.GLOBAL_SEED
-    torch.manual_seed(s)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(s)
+# Re-exported so existing `from app.models.gat import set_seed` keeps working.
+from app.models.seeding import set_seed  # noqa: F401
 
 
 class GATLayer(nn.Module):
@@ -58,6 +54,9 @@ class GATLayer(nn.Module):
         self.W_val = nn.Linear(node_in_dim, out_dim, bias=False)
         self.W_self = nn.Linear(node_in_dim, out_dim, bias=False)
         
+        # Volumetric bypass gate (learnable vector weight)
+        self.vol_weight = nn.Parameter(torch.full((out_dim,), 0.01))
+
         # Attention vector
         self.a = nn.Parameter(torch.empty(size=(out_dim, 1)))
         nn.init.xavier_uniform_(self.a.data, gain=1.414)
@@ -78,11 +77,10 @@ class GATLayer(nn.Module):
                     torch.zeros((0, self.out_dim), device=x.device, dtype=x.dtype),
                     torch.empty((0, 1), device=x.device, dtype=x.dtype)
                 )
-            else:
-                return (
-                    torch.zeros((num_nodes, self.out_dim), device=x.device, dtype=x.dtype),
-                    torch.empty((0, 1), device=x.device, dtype=x.dtype)
-                )
+            return (
+                self.W_self(x),
+                torch.empty((0, 1), device=x.device, dtype=x.dtype)
+            )
 
         src_idx = edge_index[0]
         dst_idx = edge_index[1]
@@ -121,6 +119,13 @@ class GATLayer(nn.Module):
 
         out = torch.zeros((num_nodes, self.out_dim), device=x.device, dtype=x.dtype)
         out.scatter_add_(0, dst_idx.unsqueeze(-1).expand(-1, self.out_dim), weighted_val)
+
+        # Surgical Addition: Raw magnitude sum (non-softmaxed) to bypass volume destruction
+        raw_edge_sum = torch.zeros((num_nodes, self.out_dim), device=x.device, dtype=x.dtype)
+        raw_edge_sum.scatter_add_(0, dst_idx.unsqueeze(-1).expand(-1, self.out_dim), z_edge)
+        
+        # Apply the learnable gate before addition
+        out = out + (raw_edge_sum * self.vol_weight)
 
         # GraphSAGE-style self-loop fix: Add node's own projected features
         out = out + self.W_self(x)

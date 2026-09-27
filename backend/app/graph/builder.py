@@ -49,9 +49,11 @@ When converted to a PyG Data object later:
 
 from __future__ import annotations
 
+import math
 from collections import defaultdict
 from datetime import datetime
 
+from app import config
 from app.schemas import DataSource, NetworkEvent, GraphNode, GraphEdge, GraphWindow
 
 
@@ -91,8 +93,27 @@ _EDGE_SCALE_BOUNDS: dict[str, tuple[float, float]] = {
 }
 
 def _scale(value: float, feature_name: str, bounds_dict: dict) -> float:
+    """Map a raw feature into [0.0, 1.0]. Mode set by config.FEATURE_SCALING.
+
+    Both modes are monotonic and share endpoints (lo -> 0.0, hi -> 1.0):
+
+      linear : clip(x, lo, hi) / hi
+      log    : log1p(clip(x, lo, hi) - lo) / log1p(hi - lo)
+
+    The bounds are flood ceilings, far above typical traffic, so linear leaves
+    real values tiny: measured over 58,891 nodes, 100% of out_bytes below 0.01
+    with a p99 of 0.00059. The log form spreads that out (a 59 KB window goes
+    from ~0.00059 to ~0.60), which measurably helps low-volume attacks and
+    measurably hurts volumetric ones. See config.FEATURE_SCALING for the
+    per-fold numbers; linear is the default on aggregate ROC-AUC.
+    """
     lo, hi = bounds_dict[feature_name]
     clipped = max(lo, min(value, hi))
+    span = hi - lo
+    if span <= 0:
+        return 0.0
+    if config.FEATURE_SCALING == "log":
+        return math.log1p(clipped - lo) / math.log1p(span)
     return clipped / hi
 
 class _NodeBuilder:
@@ -178,6 +199,7 @@ def build_graph(
     window_start: datetime,
     window_end: datetime,
     source: DataSource = DataSource.REAL,
+    window_features: list[float] | None = None,
 ) -> GraphWindow:
     """Convert a window's NetworkEvents into a deterministic GraphWindow.
 
@@ -194,6 +216,7 @@ def build_graph(
             num_nodes=0,
             num_edges=0,
             source=source,
+            window_features=list(window_features or []),
         )
 
     # 1. Aggregate data per node IP and per edge pair
@@ -247,4 +270,5 @@ def build_graph(
         num_nodes=len(nodes),
         num_edges=len(edges),
         source=source,
+        window_features=list(window_features or []),
     )

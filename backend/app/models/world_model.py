@@ -12,15 +12,12 @@ import torch
 import torch.nn as nn
 from app import config
 from app.schemas import GraphWindow, PredictionResult, MitreStage
-from app.graph.converter import window_to_tensors
+from app.graph.converter import window_to_tensors, window_features_to_tensor
 from app.models.gat import GATEncoder
 from app.models.lstm import LSTMEncoder
 
-def set_seed(seed: int | None = None) -> None:
-    s = seed if seed is not None else config.GLOBAL_SEED
-    torch.manual_seed(s)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(s)
+# Re-exported so existing `from app.models.world_model import set_seed` keeps working.
+from app.models.seeding import set_seed  # noqa: F401
 
 class WorldModel(nn.Module):
     def __init__(
@@ -35,9 +32,15 @@ class WorldModel(nn.Module):
         lstm_num_layers: int,
         lstm_dropout: float,
         num_mitre_stages: int,
+        window_feat_dim: int = 0,
     ):
         super().__init__()
-        
+
+        # Width of the extractor's per-window feature vector fused into each
+        # LSTM timestep alongside the GAT embedding. 0 disables fusion and
+        # reproduces the graph-only architecture.
+        self.window_feat_dim = window_feat_dim
+
         self.gat = GATEncoder(
             node_in_dim=node_in_dim,
             edge_in_dim=edge_in_dim,
@@ -47,8 +50,9 @@ class WorldModel(nn.Module):
             dropout=gat_dropout,
         )
         
+        # GAT readout is mean+max concatenated, hence the * 2.
         self.lstm = LSTMEncoder(
-            input_dim=gat_out_dim * 2,
+            input_dim=gat_out_dim * 2 + window_feat_dim,
             hidden_dim=lstm_hidden_dim,
             num_layers=lstm_num_layers,
             dropout=lstm_dropout,
@@ -61,6 +65,47 @@ class WorldModel(nn.Module):
         
         # Head 2: MITRE Stage Classification (Multi-class)
         self.mitre_head = nn.Linear(lstm_hidden_dim, num_mitre_stages)
+
+    def encode(self, windows: list[GraphWindow]) -> torch.Tensor:
+        """Run GAT-per-window then the LSTM, returning [1, lstm_hidden_dim].
+
+        This is the single encoding path. `forward` wraps it for inference and
+        training calls it via `logits`, so the two cannot drift apart — they
+        previously did, which is how the fused window features and any future
+        encoder change would silently apply to only one of them.
+        """
+        if not windows:
+            raise ValueError("Input sequence cannot be empty.")
+
+        device = next(self.parameters()).device
+
+        step_vectors = []
+        for gw in windows:
+            x, edge_index, edge_attr = window_to_tensors(
+                gw, dtype=torch.float32, device=device
+            )
+            emb = self.gat(x, edge_index, edge_attr)
+
+            if self.window_feat_dim > 0:
+                wf = window_features_to_tensor(
+                    gw, self.window_feat_dim, dtype=torch.float32, device=device
+                )
+                emb = torch.cat([emb, wf], dim=0)
+
+            step_vectors.append(emb)
+
+        # [seq_len, feat] -> [1, seq_len, feat]
+        seq_tensor = torch.stack(step_vectors, dim=0).unsqueeze(0)
+        return self.lstm(seq_tensor)
+
+    def logits(self, windows: list[GraphWindow]) -> tuple[torch.Tensor, torch.Tensor]:
+        """Raw (attack_logits [1,1], mitre_logits [1,num_stages]) for loss computation.
+
+        Training needs logits, not the probabilities `forward` returns; exposing
+        them here removes the duplicated encoder that used to live in train.py.
+        """
+        summary_state = self.encode(windows)
+        return self.attack_head(summary_state), self.mitre_head(summary_state)
 
     def forward(self, windows: list[GraphWindow]) -> PredictionResult:
         """
@@ -79,33 +124,10 @@ class WorldModel(nn.Module):
         PredictionResult
             A typed pydantic object mapping the final outputs.
         """
-        if not windows:
-            raise ValueError("Input sequence cannot be empty.")
+        summary_state = self.encode(windows)
+        attack_logits = self.attack_head(summary_state)  # [1, 1]
+        mitre_logits = self.mitre_head(summary_state)    # [1, num_mitre_stages]
 
-        gat_embeddings = []
-        for gw in windows:
-            # Convert to tensors
-            x, edge_index, edge_attr = window_to_tensors(
-                gw, dtype=torch.float32, device=next(self.parameters()).device
-            )
-            
-            # GAT pass
-            emb = self.gat(x, edge_index, edge_attr)
-            gat_embeddings.append(emb)
-            
-        # Shape: [seq_len, gat_out_dim]
-        seq_tensor = torch.stack(gat_embeddings, dim=0)
-        
-        # Add batch dimension: [1, seq_len, gat_out_dim]
-        seq_tensor = seq_tensor.unsqueeze(0)
-        
-        # LSTM pass -> [1, lstm_hidden_dim]
-        summary_state = self.lstm(seq_tensor)
-        
-        # Prediction Heads
-        attack_logits = self.attack_head(summary_state) # [1, 1]
-        mitre_logits = self.mitre_head(summary_state)   # [1, num_mitre_stages]
-        
         # Activations
         attack_prob = torch.sigmoid(attack_logits).squeeze().item()
         mitre_probs = torch.softmax(mitre_logits, dim=-1).squeeze(0) # [num_mitre_stages]

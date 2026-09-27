@@ -12,11 +12,8 @@ import torch
 import torch.nn as nn
 from app import config
 
-def set_seed(seed: int | None = None) -> None:
-    s = seed if seed is not None else config.GLOBAL_SEED
-    torch.manual_seed(s)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(s)
+# Re-exported so existing `from app.models.lstm import set_seed` keeps working.
+from app.models.seeding import set_seed  # noqa: F401
 
 class LSTMEncoder(nn.Module):
     def __init__(

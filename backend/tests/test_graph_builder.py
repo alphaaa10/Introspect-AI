@@ -13,13 +13,74 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.schemas import DataSource, NetworkEvent, Protocol
-from app.graph.builder import build_graph, _NODE_SCALE_BOUNDS, _EDGE_SCALE_BOUNDS
+from app.graph.builder import build_graph, _scale, _NODE_SCALE_BOUNDS, _EDGE_SCALE_BOUNDS
+
+# These helpers deliberately delegate to _scale rather than restating the
+# formula: the tests below assert the builder's *aggregation* (which flows sum
+# into which node/edge), and must not fail merely because the scaling curve
+# changed. The scaling contract itself is covered by TestScaling.
 
 def sn(val, name):
-    return pytest.approx(val / _NODE_SCALE_BOUNDS[name][1])
+    return pytest.approx(_scale(float(val), name, _NODE_SCALE_BOUNDS))
 
 def se(val, name):
-    return pytest.approx(val / _EDGE_SCALE_BOUNDS[name][1])
+    return pytest.approx(_scale(float(val), name, _EDGE_SCALE_BOUNDS))
+
+
+class TestScaling:
+    """The properties the rest of the pipeline relies on _scale having."""
+
+    @pytest.mark.parametrize("name", sorted(_NODE_SCALE_BOUNDS))
+    def test_endpoints_map_to_unit_interval(self, name):
+        lo, hi = _NODE_SCALE_BOUNDS[name]
+        assert _scale(lo, name, _NODE_SCALE_BOUNDS) == pytest.approx(0.0)
+        assert _scale(hi, name, _NODE_SCALE_BOUNDS) == pytest.approx(1.0)
+
+    @pytest.mark.parametrize("name", sorted(_EDGE_SCALE_BOUNDS))
+    def test_edge_endpoints_map_to_unit_interval(self, name):
+        lo, hi = _EDGE_SCALE_BOUNDS[name]
+        assert _scale(lo, name, _EDGE_SCALE_BOUNDS) == pytest.approx(0.0)
+        assert _scale(hi, name, _EDGE_SCALE_BOUNDS) == pytest.approx(1.0)
+
+    def test_monotonic_non_decreasing(self):
+        prev = -1.0
+        for v in [0, 1, 10, 100, 1_000, 10_000, 100_000, 1_000_000, 1e7, 1e8]:
+            cur = _scale(float(v), "out_bytes", _NODE_SCALE_BOUNDS)
+            assert cur >= prev
+            prev = cur
+
+    def test_clips_out_of_range(self):
+        lo, hi = _NODE_SCALE_BOUNDS["out_bytes"]
+        assert _scale(-5.0, "out_bytes", _NODE_SCALE_BOUNDS) == pytest.approx(0.0)
+        assert _scale(hi * 10, "out_bytes", _NODE_SCALE_BOUNDS) == pytest.approx(1.0)
+
+    def test_log_mode_uses_the_usable_range_for_realistic_values(self):
+        """log mode must spread realistic traffic across the range.
+
+        Linear scaling against the 1e8 ceiling puts a 59 KB window (the measured
+        p99) at 0.00059. log mode exists to fix that; it measurably helps
+        low-volume attacks and measurably hurts volumetric ones, which is why
+        linear remains the default. See config.FEATURE_SCALING.
+        """
+        from app import config
+        prev = config.FEATURE_SCALING
+        try:
+            config.FEATURE_SCALING = "log"
+            assert _scale(59_000.0, "out_bytes", _NODE_SCALE_BOUNDS) > 0.5
+        finally:
+            config.FEATURE_SCALING = prev
+
+    def test_both_modes_share_endpoints(self):
+        from app import config
+        prev = config.FEATURE_SCALING
+        try:
+            for mode in ("linear", "log"):
+                config.FEATURE_SCALING = mode
+                for name, (lo, hi) in _NODE_SCALE_BOUNDS.items():
+                    assert _scale(lo, name, _NODE_SCALE_BOUNDS) == pytest.approx(0.0), (mode, name)
+                    assert _scale(hi, name, _NODE_SCALE_BOUNDS) == pytest.approx(1.0), (mode, name)
+        finally:
+            config.FEATURE_SCALING = prev
 
 
 _T0 = datetime(2018, 2, 14, 10, 0, 0, tzinfo=timezone.utc)

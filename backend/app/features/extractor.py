@@ -282,17 +282,24 @@ def _encode_categorical(events: list[NetworkEvent]) -> dict[str, float]:
 
 
 def _scale(value: float, feature_name: str) -> float:
-    """Apply fixed-bounds min-max scaling.
+    """Apply logarithmic fixed-bounds scaling.
 
-    Formula: clip(value, lo, hi) / hi
-    (lo == 0 for all features, so this is equivalent to min-max with
-    a fixed zero lower bound.)
+    Formula: log1p(clip(value, lo, hi) - lo) / log1p(hi - lo)
 
-    Returns a value in [0.0, 1.0].
+    Was linear (`clipped / hi`). The bounds here are flood/saturation ceilings
+    (1e8 bytes, 1e9 bytes/s, 1e6 pkt/s), which are orders of magnitude above
+    typical traffic, so linear scaling collapsed almost every real window into
+    the bottom 1% of the range. See the matching note in graph/builder.py.
+
+    Monotonic, same endpoints (lo -> 0.0, hi -> 1.0), returns [0.0, 1.0].
     """
     lo, hi = _SCALE_BOUNDS[feature_name]
     clipped = max(lo, min(value, hi))
-    # hi > 0 guaranteed by construction; no division by zero possible.
+    span = hi - lo
+    if span <= 0:
+        return 0.0
+    if config.FEATURE_SCALING == "log":
+        return math.log1p(clipped - lo) / math.log1p(span)
     return clipped / hi
 
 

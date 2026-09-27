@@ -46,6 +46,29 @@ FEATURE_NAMES: list[str] = [
 
 NUM_FEATURES: int = len(FEATURE_NAMES)  # = 21
 
+# ── Feature scaling mode ───────────────────────────────────────
+# How graph/builder.py and features/extractor.py map raw values into [0, 1].
+#
+#   "linear" : clip(x, lo, hi) / hi
+#   "log"    : log1p(clip(x, lo, hi) - lo) / log1p(hi - lo)
+#
+# Measured on the five day slices (LODO, 10 epochs, 4 training days, fixed 0.5
+# threshold), mean ROC-AUC over the four evaluable folds:
+#
+#   linear : 0.9707
+#   log    : 0.8941
+#
+# The two are not uniformly ordered. "log" wins on the low-volume fold
+# (tuesday/Patator: 0.9759 -> 1.0000) because linear scaling against a 1e8
+# ceiling squashes ordinary traffic to ~1e-4. But it loses on every volumetric
+# fold (thursday 0.9787 -> 0.8191, friday 1.0000 -> 0.8796), because it
+# compresses the upper tail where flood magnitude is the signal.
+#
+# "linear" is the default on the strength of the aggregate. Override per run
+# with train.py --scaling, or SENTINEL_FEATURE_SCALING, and A/B it against your
+# own attack mix before trusting either.
+FEATURE_SCALING: str = os.environ.get("SENTINEL_FEATURE_SCALING", "linear")
+
 # Temporal window size used by features/extractor.py windowing helper.
 WINDOW_SIZE_SECONDS: int = 60
 
@@ -64,11 +87,11 @@ GLOBAL_SEED: int = 42
 
 # ── Architecture parameters ─────────────────────────────────────
 # Dimensions for the Graph Attention Network encoder
-GAT_HIDDEN_DIM: int = 64
+GAT_HIDDEN_DIM: int = 128
 
 # Recommended maximum sequence length fed to the LSTM encoder.
 # The LSTM itself enforces nothing — this is a contract for upstream callers.
-SEQUENCE_LENGTH: int = 10
+SEQUENCE_LENGTH: int = 20
 
 # Number of MitreStage enum values in schemas.py.
 # MUST equal len(list(MitreStage)). Update here if the enum changes.

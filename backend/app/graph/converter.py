@@ -15,6 +15,34 @@ from app.schemas import GraphWindow
 from app.graph.builder import NODE_FEATURE_NAMES, EDGE_FEATURE_NAMES
 
 
+def window_features_to_tensor(
+    gw: GraphWindow,
+    expected_dim: int,
+    dtype: torch.dtype = torch.float32,
+    device: torch.device | str = "cpu",
+) -> torch.Tensor:
+    """Return the window's 21-dim extractor feature vector as a [expected_dim] tensor.
+
+    These are the features config.FEATURE_NAMES describes — flag counts,
+    unique_dst_ports, IAT statistics, packets/sec — which the graph's 5 node and
+    6 edge features do not capture. They were computed by the extractor and then
+    dropped on the floor before this was wired up.
+
+    A window with no features attached yields zeros, so a model configured for
+    fusion still runs on graph-only windows (the API's inference path) instead
+    of raising a shape error.
+    """
+    feats = gw.window_features
+    if not feats:
+        return torch.zeros(expected_dim, dtype=dtype, device=device)
+    if len(feats) != expected_dim:
+        raise ValueError(
+            f"window_features has length {len(feats)} but the model expects "
+            f"{expected_dim}. These must agree with config.NUM_FEATURES."
+        )
+    return torch.tensor(feats, dtype=dtype, device=device)
+
+
 def window_to_tensors(
     gw: GraphWindow,
     dtype: torch.dtype = torch.float32,

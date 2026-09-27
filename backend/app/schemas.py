@@ -111,6 +111,11 @@ class GraphWindow(BaseModel):
     num_nodes: int = Field(ge=0)
     num_edges: int = Field(ge=0)
     source: DataSource
+    # The extractor's 21-dim FeatureRecord.feature_vector for this same window,
+    # carried alongside the graph so the model can consume both. Defaults to
+    # empty for callers that only need graph structure (and for older
+    # serialised windows). When populated, len() == config.NUM_FEATURES.
+    window_features: list[float] = []
 
 class PredictionResult(BaseModel):
     window_id: str

@@ -150,12 +150,12 @@ class TestFeatureOrdering:
 
         # src_port is at index 2 per FEATURE_NAMES
         idx_src_port = config.FEATURE_NAMES.index("src_port")
-        expected_src_port_scaled = 54321.0 / 65535.0
+        expected_src_port_scaled = _scale(54321.0, "src_port")
         assert fv[idx_src_port] == pytest.approx(expected_src_port_scaled, rel=1e-5)
 
         # dst_port is at index 3
         idx_dst_port = config.FEATURE_NAMES.index("dst_port")
-        expected_dst_port_scaled = 80.0 / 65535.0
+        expected_dst_port_scaled = _scale(80.0, "dst_port")
         assert fv[idx_dst_port] == pytest.approx(expected_dst_port_scaled, rel=1e-5)
 
 
@@ -193,51 +193,51 @@ class TestNumericCorrectness:
         return self.fv[self.names.index(name)]
 
     def test_duration_scaled(self):
-        assert self._at("duration") == pytest.approx(2.0 / 600.0, rel=1e-6)
+        assert self._at("duration") == pytest.approx(_scale(2.0, "duration"), rel=1e-6)
 
     def test_protocol_type_tcp(self):
-        assert self._at("protocol_type") == pytest.approx(6.0 / 17.0, rel=1e-6)
+        assert self._at("protocol_type") == pytest.approx(_scale(6.0, "protocol_type"), rel=1e-6)
 
     def test_src_port_scaled(self):
-        assert self._at("src_port") == pytest.approx(54321.0 / 65535.0, rel=1e-6)
+        assert self._at("src_port") == pytest.approx(_scale(54321.0, "src_port"), rel=1e-6)
 
     def test_dst_port_scaled(self):
-        assert self._at("dst_port") == pytest.approx(80.0 / 65535.0, rel=1e-6)
+        assert self._at("dst_port") == pytest.approx(_scale(80.0, "dst_port"), rel=1e-6)
 
     def test_fwd_packets_scaled(self):
-        assert self._at("fwd_packets") == pytest.approx(10.0 / 100_000.0, rel=1e-6)
+        assert self._at("fwd_packets") == pytest.approx(_scale(10.0, "fwd_packets"), rel=1e-6)
 
     def test_bwd_packets_scaled(self):
-        assert self._at("bwd_packets") == pytest.approx(5.0 / 100_000.0, rel=1e-6)
+        assert self._at("bwd_packets") == pytest.approx(_scale(5.0, "bwd_packets"), rel=1e-6)
 
     def test_fwd_bytes_scaled(self):
-        assert self._at("fwd_bytes") == pytest.approx(1000.0 / 1e8, rel=1e-6)
+        assert self._at("fwd_bytes") == pytest.approx(_scale(1000.0, "fwd_bytes"), rel=1e-6)
 
     def test_bwd_bytes_scaled(self):
-        assert self._at("bwd_bytes") == pytest.approx(500.0 / 1e8, rel=1e-6)
+        assert self._at("bwd_bytes") == pytest.approx(_scale(500.0, "bwd_bytes"), rel=1e-6)
 
     def test_fwd_pkt_len_mean(self):
         # sum(fwd_bytes)/sum(fwd_pkts) = 1000/10 = 100.0, scaled /1500
-        assert self._at("fwd_pkt_len_mean") == pytest.approx(100.0 / 1500.0, rel=1e-6)
+        assert self._at("fwd_pkt_len_mean") == pytest.approx(_scale(100.0, "fwd_pkt_len_mean"), rel=1e-6)
 
     def test_bwd_pkt_len_mean(self):
         # 500/5 = 100.0, scaled /1500
-        assert self._at("bwd_pkt_len_mean") == pytest.approx(100.0 / 1500.0, rel=1e-6)
+        assert self._at("bwd_pkt_len_mean") == pytest.approx(_scale(100.0, "bwd_pkt_len_mean"), rel=1e-6)
 
     def test_flow_bytes_per_s(self):
         # (1000+500)/2.0 = 750.0, scaled /1e9
-        assert self._at("flow_bytes_per_s") == pytest.approx(750.0 / 1e9, rel=1e-6)
+        assert self._at("flow_bytes_per_s") == pytest.approx(_scale(750.0, "flow_bytes_per_s"), rel=1e-6)
 
     def test_flow_pkts_per_s(self):
         # (10+5)/2.0 = 7.5, scaled /1e6
-        assert self._at("flow_pkts_per_s") == pytest.approx(7.5 / 1e6, rel=1e-6)
+        assert self._at("flow_pkts_per_s") == pytest.approx(_scale(7.5, "flow_pkts_per_s"), rel=1e-6)
 
     def test_syn_flag_cnt(self):
         # tcp_flags="SYN,ACK" -> SYN present -> count=1, scaled /10000
-        assert self._at("syn_flag_cnt") == pytest.approx(1.0 / 10_000.0, rel=1e-6)
+        assert self._at("syn_flag_cnt") == pytest.approx(_scale(1.0, "syn_flag_cnt"), rel=1e-6)
 
     def test_ack_flag_cnt(self):
-        assert self._at("ack_flag_cnt") == pytest.approx(1.0 / 10_000.0, rel=1e-6)
+        assert self._at("ack_flag_cnt") == pytest.approx(_scale(1.0, "ack_flag_cnt"), rel=1e-6)
 
     def test_psh_flag_cnt_zero(self):
         assert self._at("psh_flag_cnt") == pytest.approx(0.0, abs=1e-12)
@@ -250,11 +250,11 @@ class TestNumericCorrectness:
 
     def test_unique_dst_ports(self):
         # 1 unique port, scaled /1024
-        assert self._at("unique_dst_ports") == pytest.approx(1.0 / 1024.0, rel=1e-6)
+        assert self._at("unique_dst_ports") == pytest.approx(_scale(1.0, "unique_dst_ports"), rel=1e-6)
 
     def test_unique_dst_ips(self):
         # 1 unique IP, scaled /5000
-        assert self._at("unique_dst_ips") == pytest.approx(1.0 / 5000.0, rel=1e-6)
+        assert self._at("unique_dst_ips") == pytest.approx(_scale(1.0, "unique_dst_ips"), rel=1e-6)
 
     def test_iat_mean_single_event_sentinel(self):
         # Only 1 event -> IAT undefined -> sentinel 0.0
@@ -272,7 +272,7 @@ class TestNumericCorrectness:
         idx_iat_mean = config.FEATURE_NAMES.index("iat_mean")
         idx_iat_std  = config.FEATURE_NAMES.index("iat_std")
         # iat_mean = 10s, scaled /60.0
-        assert fv[idx_iat_mean] == pytest.approx(10.0 / 60.0, rel=1e-6)
+        assert fv[idx_iat_mean] == pytest.approx(_scale(10.0, "iat_mean"), rel=1e-6)
         # iat_std = 0.0 (only one IAT, variance=0)
         assert fv[idx_iat_std] == pytest.approx(0.0, abs=1e-12)
 
@@ -364,9 +364,43 @@ class TestScalingMetadata:
         assert bounds is _SCALE_BOUNDS  # same object, not a copy
 
     def test_scale_function_uses_bounds(self):
-        """_scale('syn_flag_cnt', 5000) should equal 5000/10000 = 0.5."""
-        result = _scale(5000.0, "syn_flag_cnt")
-        assert result == pytest.approx(0.5, rel=1e-9)
+        """_scale must map each feature's upper bound to exactly 1.0."""
+        for name, (lo, hi) in _SCALE_BOUNDS.items():
+            assert _scale(hi, name) == pytest.approx(1.0), name
+            assert _scale(lo, name) == pytest.approx(0.0), name
+
+    def test_scale_is_monotonic_non_decreasing(self):
+        prev = -1.0
+        for v in [0, 1, 10, 100, 1_000, 10_000, 1e6, 1e7, 1e8]:
+            cur = _scale(float(v), "fwd_bytes")
+            assert cur >= prev
+            prev = cur
+
+    def test_log_mode_spends_range_on_realistic_values(self):
+        """In log mode a 1 MB window must land well inside the range.
+
+        The bounds are flood ceilings, so 1 MB is an ordinary busy window.
+        Linear mode leaves it at ~1e-2; log mode is the alternative. Linear is
+        the default on aggregate ROC-AUC - see config.FEATURE_SCALING.
+        """
+        prev = config.FEATURE_SCALING
+        try:
+            config.FEATURE_SCALING = "log"
+            assert _scale(1e6, "fwd_bytes") > 0.5
+        finally:
+            config.FEATURE_SCALING = prev
+
+    def test_both_modes_stay_in_unit_interval(self):
+        prev = config.FEATURE_SCALING
+        try:
+            for mode in ("linear", "log"):
+                config.FEATURE_SCALING = mode
+                for name, (lo, hi) in _SCALE_BOUNDS.items():
+                    for v in (lo, hi, hi / 2, hi * 5, -1.0):
+                        out = _scale(v, name)
+                        assert 0.0 <= out <= 1.0, (mode, name, v, out)
+        finally:
+            config.FEATURE_SCALING = prev
 
     def test_scale_clipping_lower_bound(self):
         """Negative input must be clipped to lo (0.0)."""
