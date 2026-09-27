@@ -14,10 +14,11 @@ import torch.optim as optim
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, confusion_matrix
 
 from app import config
-from app.schemas import DataSource, MitreStage
+from app.schemas import DataSource, MitreStage, GraphWindow
 from app.ingestion.parser import parse_csv, parse_cicids2017_csv
 from app.features.extractor import window_and_extract
 from app.graph.builder import build_graph, NODE_FEATURE_NAMES, EDGE_FEATURE_NAMES
+from app.graph.converter import window_to_tensors
 from app.models.world_model import WorldModel, set_seed
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -411,6 +412,110 @@ def compute_metrics(y_true_attack, y_pred_attack_probs, y_true_mitre, y_pred_mit
 
     return metrics
 
+def collate_sequences(
+    batch: list[tuple[list[GraphWindow], tuple[int, int]]],
+    device: torch.device,
+) -> dict:
+    """Pack a list of (sequence, target) pairs into one disjoint-union graph.
+
+    BATCHING STRATEGY: offset-based. Every graph's node indices are shifted by a
+    running offset so no two graphs in the batch share a node index. The
+    attention softmax inside GATLayer is a scatter over destination node
+    indices, so disjoint indices make cross-graph message passing impossible and
+    GATLayer needs no change whatsoever. Only GATEncoder's readout became
+    per-graph aware. Test 3 asserts the no-leakage property empirically rather
+    than trusting this argument.
+
+    Padded timesteps are materialised as EMPTY graphs (zero nodes, zero edges)
+    so that graph ids are exactly `b * T_max + t`. That keeps the reshape to
+    [B, T_max, D] a plain view instead of a scatter, and costs nothing because
+    an empty graph contributes no rows. They are excluded from the LSTM by
+    packing, not by omission.
+
+    Returns a dict with:
+      graph_x                 [total_nodes, node_dim]
+      graph_edge_index        [2, total_edges]      node offsets applied
+      graph_edge_attr         [total_edges, edge_dim]
+      graph_batch_index       [total_nodes]         node -> graph id (0..B*T_max-1)
+      graph_window_features   [B*T_max, NUM_FEATURES]
+      window_to_seq           [B*T_max]             graph id -> sequence id (0..B-1)
+      seq_lengths             [B]                   valid timesteps per sequence
+      seq_mask                [B, T_max] bool       True where valid
+      is_attack               [B] float
+      mitre_idx               [B] long
+      T_max                   int
+
+    `graph_window_features` is not in the original spec's list but is required:
+    the current architecture fuses the extractor's 21 features at every
+    timestep, so omitting them would silently drop that fusion in the batched
+    path only — the exact class of divergence that the duplicated encoder in
+    train_one_epoch used to cause.
+    """
+    if not batch:
+        raise ValueError("collate_sequences received an empty batch")
+
+    B = len(batch)
+    T_max = max(len(seq) for seq, _ in batch)
+    num_graphs = B * T_max
+    n_node_feats = len(NODE_FEATURE_NAMES)
+    n_edge_feats = len(EDGE_FEATURE_NAMES)
+
+    xs, eis, eas, batch_idx = [], [], [], []
+    window_to_seq = torch.zeros(num_graphs, dtype=torch.long)
+    wf = torch.zeros((num_graphs, config.NUM_FEATURES), dtype=torch.float32)
+    seq_lengths = torch.zeros(B, dtype=torch.long)
+    seq_mask = torch.zeros((B, T_max), dtype=torch.bool)
+    is_attack = torch.zeros(B, dtype=torch.float32)
+    mitre_idx = torch.zeros(B, dtype=torch.long)
+
+    node_offset = 0
+    for b, (seq, (atk, mit)) in enumerate(batch):
+        seq_lengths[b] = len(seq)
+        is_attack[b] = float(atk)
+        mitre_idx[b] = int(mit)
+        for t in range(T_max):
+            gid = b * T_max + t
+            window_to_seq[gid] = b
+            if t >= len(seq):
+                continue  # padded slot: an empty graph contributes no rows
+            seq_mask[b, t] = True
+            gw = seq[t]
+            x, ei, ea = window_to_tensors(gw, dtype=torch.float32, device="cpu")
+            n = x.size(0)
+            if gw.window_features:
+                wf[gid] = torch.tensor(gw.window_features, dtype=torch.float32)
+            if n == 0:
+                # Empty graph: no nodes, no edges, nothing to offset. The
+                # concatenation below simply skips it and its readout row stays
+                # zero, matching GATEncoder's documented empty-graph policy.
+                continue
+            xs.append(x)
+            batch_idx.append(torch.full((n,), gid, dtype=torch.long))
+            if ei.size(1) > 0:
+                eis.append(ei + node_offset)
+                eas.append(ea)
+            node_offset += n
+
+    graph_x = torch.cat(xs, 0) if xs else torch.empty((0, n_node_feats), dtype=torch.float32)
+    graph_batch_index = torch.cat(batch_idx, 0) if batch_idx else torch.empty(0, dtype=torch.long)
+    graph_edge_index = torch.cat(eis, 1) if eis else torch.empty((2, 0), dtype=torch.long)
+    graph_edge_attr = torch.cat(eas, 0) if eas else torch.empty((0, n_edge_feats), dtype=torch.float32)
+
+    return {
+        "graph_x": graph_x.to(device),
+        "graph_edge_index": graph_edge_index.to(device),
+        "graph_edge_attr": graph_edge_attr.to(device),
+        "graph_batch_index": graph_batch_index.to(device),
+        "graph_window_features": wf.to(device),
+        "window_to_seq": window_to_seq.to(device),
+        "seq_lengths": seq_lengths,          # stays on CPU: pack_padded_sequence needs it there
+        "seq_mask": seq_mask.to(device),
+        "is_attack": is_attack.to(device),
+        "mitre_idx": mitre_idx.to(device),
+        "T_max": T_max,
+    }
+
+
 ACCUM_STEPS = 64  # sequences per optimizer step (batch size is 1)
 
 def train_one_epoch(model, optimizer, sequences, targets, attack_criterion,
@@ -423,10 +528,20 @@ def train_one_epoch(model, optimizer, sequences, targets, attack_criterion,
 
     for i, (seq, (is_attack, mitre_idx)) in enumerate(zip(sequences, targets)):
 
-        # model.logits() is the same encoder path inference uses, so anything
-        # added to the model (window-feature fusion, new layers) reaches
-        # training automatically instead of needing a parallel copy here.
-        attack_logits, mitre_logits = model.logits(seq)
+        # Batched encoder at B=1. Identical maths to model.logits(seq), but the
+        # sequence's windows are fused into ONE disjoint-union graph so the GAT
+        # runs once instead of SEQUENCE_LENGTH times. Measured 2.60x faster at
+        # 156 nodes/window (69.92 -> 26.88 ms/sequence); see docs/BATCHING.md.
+        #
+        # B=1 deliberately: the loss below sees exactly one sequence, so the
+        # ACCUM_STEPS normalisation and optimizer cadence are untouched. B>1
+        # would require reconciling three separate normalisations for a further
+        # 1.35x, which is not worth the risk.
+        #
+        # model.logits(seq) remains callable and is what WorldModel.forward uses
+        # for single-sequence inference.
+        collated = collate_sequences([(seq, (is_attack, mitre_idx))], device)
+        attack_logits, mitre_logits = model.logits_batch(collated)
 
         loss_attack = attack_criterion(attack_logits.squeeze(), torch.tensor(float(is_attack), device=device))
 
@@ -470,10 +585,15 @@ def select_threshold(model, sequences, targets):
         return 0.5
 
     model.eval()
+    device = next(model.parameters()).device
     probs, ys = [], []
     with torch.no_grad():
-        for seq, (is_attack, _) in zip(sequences, targets):
-            probs.append(model(seq).attack_probability)
+        for seq, (is_attack, mitre_idx) in zip(sequences, targets):
+            # Batched encoder at B=1, matching evaluate() so the threshold is
+            # chosen on the same probabilities it will later be applied to.
+            collated = collate_sequences([(seq, (is_attack, mitre_idx))], device)
+            attack_logits, _ = model.logits_batch(collated)
+            probs.append(torch.sigmoid(attack_logits).squeeze().item())
             ys.append(is_attack)
 
     if len(set(ys)) < 2:
@@ -493,7 +613,10 @@ def evaluate_loss(model, sequences, targets, attack_criterion, mitre_criterion, 
     total = 0.0
     with torch.no_grad():
         for seq, (is_attack, mitre_idx) in zip(sequences, targets):
-            attack_logits, mitre_logits = model.logits(seq)
+            # Batched encoder at B=1, matching train_one_epoch so the validation
+            # loss is computed by the same code path that produced the weights.
+            collated = collate_sequences([(seq, (is_attack, mitre_idx))], device)
+            attack_logits, mitre_logits = model.logits_batch(collated)
             loss = attack_criterion(attack_logits.squeeze(), torch.tensor(float(is_attack), device=device))
             # Masked exactly as in train_one_epoch, or the validation loss would
             # measure a different objective than the one being optimised.
@@ -505,15 +628,22 @@ def evaluate_loss(model, sequences, targets, attack_criterion, mitre_criterion, 
 
 def evaluate(model, sequences, targets, threshold=0.5):
     model.eval()
+    device = next(model.parameters()).device
     y_true_attack, y_pred_attack_probs = [], []
     y_true_mitre, y_pred_mitre = [], []
-    
+
     with torch.no_grad():
         for seq, (is_attack, mitre_idx) in zip(sequences, targets):
-            result = model(seq)
+            # Batched encoder at B=1, the same path training uses. The
+            # activations below reproduce exactly what WorldModel.forward
+            # returns as attack_probability and stage_probabilities; forward
+            # itself stays the single-sequence inference entry point for the API.
+            collated = collate_sequences([(seq, (is_attack, mitre_idx))], device)
+            attack_logits, mitre_logits = model.logits_batch(collated)
+
             y_true_attack.append(is_attack)
-            y_pred_attack_probs.append(result.attack_probability)
-            
+            y_pred_attack_probs.append(torch.sigmoid(attack_logits).squeeze().item())
+
             y_true_mitre.append(mitre_idx)
             # Pick among ATTACK stages, skipping BENIGN at index 0.
             #
@@ -522,7 +652,7 @@ def evaluate(model, sequences, targets, threshold=0.5):
             # argmax let an unsupervised logit win and be scored as a wrong
             # stage. The binary head answers "is this an attack"; this answers
             # "which stage, given that it is".
-            probs = result.stage_probabilities
+            probs = torch.softmax(mitre_logits, dim=-1).squeeze(0).tolist()
             pred_mitre_idx = 1 + max(range(len(probs) - 1), key=lambda i: probs[i + 1])
             y_pred_mitre.append(pred_mitre_idx)
             

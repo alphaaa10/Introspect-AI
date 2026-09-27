@@ -181,11 +181,27 @@ class GATEncoder(nn.Module):
         x: torch.Tensor,
         edge_index: torch.Tensor,
         edge_attr: torch.Tensor,
+        batch_index: torch.Tensor | None = None,
+        num_graphs: int | None = None,
     ) -> torch.Tensor:
         """
-        Forward pass for a single graph.
-        Returns:
-            graph_embedding: [output_dim] tensor.
+        Forward pass.
+
+        batch_index is None (default)
+            Single graph. Returns [output_dim * 2]. Behaviour is unchanged from
+            before batching existed.
+
+        batch_index is a [num_nodes] long tensor
+            Many graphs concatenated into one disjoint union. Returns
+            [num_graphs, output_dim * 2].
+
+            BATCHING STRATEGY: node indices are offset per graph by the caller
+            (see train.collate_sequences), so no two graphs share a node index.
+            The attention softmax in GATLayer is computed per destination node
+            via scatter over those indices, so disjoint indices mean no message
+            can cross a graph boundary and GATLayer needs no modification at
+            all. Only the readout below has to become per-graph, because mean
+            and max over *all* nodes would mix graphs.
         """
         num_nodes = x.size(0)
 
@@ -200,7 +216,12 @@ class GATEncoder(nn.Module):
             self.latest_attention_weights = torch.empty(
                 (0, self.num_heads), device=x.device, dtype=x.dtype
             )
-            return torch.zeros(self.output_dim * 2, device=x.device, dtype=x.dtype)
+            if batch_index is None:
+                return torch.zeros(self.output_dim * 2, device=x.device, dtype=x.dtype)
+            # Every graph in the batch is empty: same zero policy, per graph.
+            return torch.zeros(
+                (num_graphs or 0, self.output_dim * 2), device=x.device, dtype=x.dtype
+            )
 
         # 1. Run all attention heads
         head_outs = []
@@ -213,8 +234,13 @@ class GATEncoder(nn.Module):
         # Concatenate head outputs: [N, head_dim] * heads -> [N, hidden_dim]
         node_embeds = torch.cat(head_outs, dim=-1)
         node_embeds = F.elu(node_embeds)
-        
+
         # Save attention weights: [E, num_heads]
+        #
+        # In the batched path this is the concatenation of every graph's edges
+        # with no edge -> graph mapping, so it is NOT per-window interpretable.
+        # The explainability consumer is single-sequence inference
+        # (WorldModel.forward), which never takes the batched path.
         if edge_index.size(1) > 0:
             self.latest_attention_weights = torch.cat(head_alphas, dim=-1)
         else:
@@ -226,10 +252,29 @@ class GATEncoder(nn.Module):
         node_embeds = self.out_proj(node_embeds)
 
         # 3. Graph-Level Readout (Mean + Max Pooling Concatenation)
-        # Note: Concatenating mean and max preserves both the holistic 
+        # Note: Concatenating mean and max preserves both the holistic
         # graph structure (mean) and localized anomaly spikes (max).
-        mean_pool = torch.mean(node_embeds, dim=0)
-        max_pool = torch.max(node_embeds, dim=0)[0]
-        graph_embedding = torch.cat([mean_pool, max_pool], dim=0)  # [output_dim * 2]
+        if batch_index is None:
+            mean_pool = torch.mean(node_embeds, dim=0)
+            max_pool = torch.max(node_embeds, dim=0)[0]
+            return torch.cat([mean_pool, max_pool], dim=0)  # [output_dim * 2]
 
-        return graph_embedding
+        G = num_graphs if num_graphs is not None else int(batch_index.max().item()) + 1
+        idx = batch_index.unsqueeze(-1).expand(-1, self.output_dim)
+
+        # mean: sum per graph / node count per graph. Graphs with zero nodes
+        # divide by a clamped 1 and stay at 0, matching the single-graph policy.
+        summed = torch.zeros((G, self.output_dim), device=x.device, dtype=x.dtype)
+        summed.scatter_add_(0, idx, node_embeds)
+        counts = torch.zeros(G, device=x.device, dtype=x.dtype)
+        counts.scatter_add_(0, batch_index, torch.ones_like(batch_index, dtype=x.dtype))
+        mean_pool = summed / counts.clamp(min=1.0).unsqueeze(-1)
+
+        # max: init 0 with include_self=False, so graphs that DO have nodes get
+        # their true maximum (the 0 init is excluded from the reduction) while
+        # empty graphs are left at 0. Initialising to -inf would leave empty
+        # graphs at -inf and poison the LSTM.
+        max_pool = torch.zeros((G, self.output_dim), device=x.device, dtype=x.dtype)
+        max_pool.scatter_reduce_(0, idx, node_embeds, reduce="amax", include_self=False)
+
+        return torch.cat([mean_pool, max_pool], dim=-1)  # [G, output_dim * 2]

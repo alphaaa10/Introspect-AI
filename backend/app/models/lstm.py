@@ -45,9 +45,23 @@ class LSTMEncoder(nn.Module):
             dropout=actual_dropout,
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, lengths: torch.Tensor | None = None) -> torch.Tensor:
         """
         Forward pass through the LSTM.
+
+        lengths is None (default)
+            Every timestep in x is valid. Behaviour unchanged from before
+            batching existed.
+
+        lengths is a [batch] tensor of valid timestep counts
+            x is right-padded. The sequence is run through
+            pack_padded_sequence, so h_n comes from each sequence's LAST VALID
+            timestep rather than from the padding. Without this, a length-5
+            sequence padded to 10 would return the hidden state after five
+            steps of zero input, which is a different (and wrong) value.
+
+            Padding is a correctness issue rather than a speed one here: the
+            summary state is what both prediction heads read.
         
         Parameters
         ----------
@@ -67,10 +81,18 @@ class LSTMEncoder(nn.Module):
         # output shape: [batch, seq_len, hidden_dim]
         # h_n shape: [num_layers, batch, hidden_dim]
         # c_n shape: [num_layers, batch, hidden_dim]
-        output, (h_n, c_n) = self.lstm(x)
-        
+        if lengths is None:
+            output, (h_n, c_n) = self.lstm(x)
+        else:
+            # enforce_sorted=False lets the caller keep its own batch order;
+            # torch sorts internally and restores the original order in h_n.
+            packed = nn.utils.rnn.pack_padded_sequence(
+                x, lengths.to("cpu"), batch_first=True, enforce_sorted=False
+            )
+            _, (h_n, c_n) = self.lstm(packed)
+
         # Extract the hidden state from the final layer
         # h_n[-1] has shape [batch, hidden_dim]
         summary_state = h_n[-1]
-        
+
         return summary_state

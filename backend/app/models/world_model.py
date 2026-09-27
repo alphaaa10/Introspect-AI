@@ -98,6 +98,56 @@ class WorldModel(nn.Module):
         seq_tensor = torch.stack(step_vectors, dim=0).unsqueeze(0)
         return self.lstm(seq_tensor)
 
+    def encode_batch(self, collated: dict) -> torch.Tensor:
+        """Per-timestep embeddings for a collated batch: [B, T_max, D].
+
+        D == gat_out_dim * 2 + window_feat_dim, i.e. the same vector the
+        unbatched `encode` feeds the LSTM at each timestep.
+
+        The whole batch's graphs are run through the GAT as ONE disjoint-union
+        graph. `collate_sequences` has already offset node indices per graph, so
+        attention cannot cross a graph boundary (see GATEncoder.forward).
+
+        Padded timesteps are present as empty graphs and come back as zeros.
+        They are excluded from the LSTM by `logits_batch` via packing, not by
+        being absent here — keeping the tensor rectangular is what makes the
+        reshape to [B, T_max, D] valid.
+        """
+        B = int(collated["seq_lengths"].size(0))
+        T_max = int(collated["T_max"])
+        num_graphs = B * T_max
+
+        # [B*T_max, gat_out_dim * 2]
+        graph_emb = self.gat(
+            collated["graph_x"],
+            collated["graph_edge_index"],
+            collated["graph_edge_attr"],
+            batch_index=collated["graph_batch_index"],
+            num_graphs=num_graphs,
+        )
+
+        if self.window_feat_dim > 0:
+            wf = collated["graph_window_features"]
+            if wf.shape != (num_graphs, self.window_feat_dim):
+                raise ValueError(
+                    f"graph_window_features has shape {tuple(wf.shape)} but the "
+                    f"model expects ({num_graphs}, {self.window_feat_dim})."
+                )
+            graph_emb = torch.cat([graph_emb, wf], dim=-1)
+
+        return graph_emb.view(B, T_max, -1)
+
+    def logits_batch(self, collated: dict) -> tuple[torch.Tensor, torch.Tensor]:
+        """Raw (attack_logits [B,1], mitre_logits [B,num_stages]) for a batch.
+
+        Mirrors `logits` for many sequences at once. The LSTM is fed through
+        pack_padded_sequence using seq_lengths, so each sequence's summary state
+        comes from its own last valid timestep and never from padding.
+        """
+        seq_inputs = self.encode_batch(collated)              # [B, T_max, D]
+        summary = self.lstm(seq_inputs, lengths=collated["seq_lengths"])  # [B, H]
+        return self.attack_head(summary), self.mitre_head(summary)
+
     def logits(self, windows: list[GraphWindow]) -> tuple[torch.Tensor, torch.Tensor]:
         """Raw (attack_logits [1,1], mitre_logits [1,num_stages]) for loss computation.
 
