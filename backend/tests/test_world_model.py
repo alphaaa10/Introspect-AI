@@ -65,7 +65,10 @@ class TestWorldModel:
         # Valid init
         model = WorldModel(**self.valid_args)
         assert model.attack_head.out_features == 1
-        assert model.mitre_head.out_features == self.num_mitre
+        # mitre_head is Linear (linear arch) or a Sequential MLP (mlp/dual_lstm);
+        # check the effective output width, not a container attribute.
+        _last = model.mitre_head if isinstance(model.mitre_head, torch.nn.Linear) else model.mitre_head[-1]
+        assert _last.out_features == self.num_mitre
         
         # Invalid dimensions pass down to submodules which raise ValueError
         invalid_args = self.valid_args.copy()

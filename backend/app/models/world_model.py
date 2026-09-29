@@ -33,6 +33,7 @@ class WorldModel(nn.Module):
         lstm_dropout: float,
         num_mitre_stages: int,
         window_feat_dim: int = 0,
+        mitre_arch: str = "mlp",
     ):
         super().__init__()
 
@@ -40,6 +41,22 @@ class WorldModel(nn.Module):
         # LSTM timestep alongside the GAT embedding. 0 disables fusion and
         # reproduces the graph-only architecture.
         self.window_feat_dim = window_feat_dim
+
+        # MITRE-head architecture. Made an explicit parameter, not a hardcoded
+        # default, because the state_dict keys differ per arch and loading a
+        # checkpoint into the wrong one silently leaves the head random (the bug
+        # that produced a meaningless confusion matrix). The loader must build
+        # the arch the checkpoint was trained with.
+        #   "linear"    : Linear(H, S)                        - keys mitre_head.{weight,bias}
+        #   "mlp"       : Linear(H,64)-ReLU-Linear(64,S)      - keys mitre_head.{0,2}.*
+        #   "dual_lstm" : separate trainable lstm_mitre on the frozen GAT
+        #                 embeddings, its summary concatenated with the target
+        #                 window's raw features, then the MLP head. Tests whether
+        #                 the binary-trained LSTM aggregation - not the GAT - is
+        #                 what collapses the overlapping stages.
+        if mitre_arch not in ("linear", "mlp", "dual_lstm"):
+            raise ValueError(f"mitre_arch must be linear|mlp|dual_lstm, got {mitre_arch!r}")
+        self.mitre_arch = mitre_arch
 
         self.gat = GATEncoder(
             node_in_dim=node_in_dim,
@@ -59,20 +76,46 @@ class WorldModel(nn.Module):
         )
         
         self.num_mitre_stages = num_mitre_stages
-        
+
         # Head 1: Attack Probability (Binary)
         self.attack_head = nn.Linear(lstm_hidden_dim, 1)
-        
+
         # Head 2: MITRE Stage Classification (Multi-class)
-        self.mitre_head = nn.Linear(lstm_hidden_dim, num_mitre_stages)
+        if mitre_arch == "dual_lstm":
+            # A second LSTM, trained only for stages, over the SAME frozen GAT
+            # per-timestep embeddings the binary LSTM sees (identical config).
+            self.lstm_mitre = LSTMEncoder(
+                input_dim=gat_out_dim * 2 + window_feat_dim,
+                hidden_dim=lstm_hidden_dim,
+                num_layers=lstm_num_layers,
+                dropout=lstm_dropout,
+            )
+            # Skip connection: the target window's raw features are concatenated
+            # to lstm_mitre's summary, so the stage head sees the type-discriminative
+            # signals (flag counts, unique_dst_ports, IAT) directly, not only what
+            # the LSTM chose to keep.
+            mitre_in_dim = lstm_hidden_dim + window_feat_dim
+        else:
+            mitre_in_dim = lstm_hidden_dim
 
-    def encode(self, windows: list[GraphWindow]) -> torch.Tensor:
-        """Run GAT-per-window then the LSTM, returning [1, lstm_hidden_dim].
+        if mitre_arch == "linear":
+            self.mitre_head = nn.Linear(mitre_in_dim, num_mitre_stages)
+        else:  # "mlp" and "dual_lstm" both use the 2-layer MLP head
+            # The MLP gives capacity to separate stage embeddings a single linear
+            # layer cannot (Impact and Credential Access overlap in the
+            # binary-trained embedding space).
+            self.mitre_head = nn.Sequential(
+                nn.Linear(mitre_in_dim, 64),
+                nn.ReLU(),
+                nn.Linear(64, num_mitre_stages),
+            )
 
-        This is the single encoding path. `forward` wraps it for inference and
-        training calls it via `logits`, so the two cannot drift apart — they
-        previously did, which is how the fused window features and any future
-        encoder change would silently apply to only one of them.
+    def _build_seq_single(self, windows: list[GraphWindow]) -> tuple[torch.Tensor, torch.Tensor]:
+        """GAT-per-window then fuse features -> ([1, seq_len, D], last_window_feats [1, wf]).
+
+        Returns the per-timestep LSTM input plus the final window's raw features
+        (for the dual_lstm skip connection). Factored out so the binary and
+        mitre paths run the GAT once and share the sequence.
         """
         if not windows:
             raise ValueError("Input sequence cannot be empty.")
@@ -80,6 +123,7 @@ class WorldModel(nn.Module):
         device = next(self.parameters()).device
 
         step_vectors = []
+        last_wf = None
         for gw in windows:
             x, edge_index, edge_attr = window_to_tensors(
                 gw, dtype=torch.float32, device=device
@@ -90,13 +134,39 @@ class WorldModel(nn.Module):
                 wf = window_features_to_tensor(
                     gw, self.window_feat_dim, dtype=torch.float32, device=device
                 )
+                last_wf = wf
                 emb = torch.cat([emb, wf], dim=0)
 
             step_vectors.append(emb)
 
-        # [seq_len, feat] -> [1, seq_len, feat]
-        seq_tensor = torch.stack(step_vectors, dim=0).unsqueeze(0)
+        seq_tensor = torch.stack(step_vectors, dim=0).unsqueeze(0)  # [1, L, D]
+        if last_wf is None:
+            last_wf = torch.zeros(self.window_feat_dim, device=device)
+        return seq_tensor, last_wf.unsqueeze(0)  # [1, wf]
+
+    def encode(self, windows: list[GraphWindow]) -> torch.Tensor:
+        """Run GAT-per-window then the binary LSTM, returning [1, lstm_hidden_dim].
+
+        This is the single encoding path for the binary summary. `forward` and
+        `logits` share it so they cannot drift apart.
+        """
+        seq_tensor, _ = self._build_seq_single(windows)
         return self.lstm(seq_tensor)
+
+    def _mitre_logits(self, seq_tensor: torch.Tensor, binary_summary: torch.Tensor,
+                      last_wf: torch.Tensor, lengths: torch.Tensor | None) -> torch.Tensor:
+        """Route the MITRE head according to mitre_arch.
+
+        linear/mlp : read the binary LSTM summary (reused, not recomputed).
+        dual_lstm  : run the separate lstm_mitre on the same per-timestep
+                     sequence, concat the target window's raw features, then head.
+        """
+        if self.mitre_arch == "dual_lstm":
+            m = self.lstm_mitre(seq_tensor, lengths=lengths)  # [B, H]
+            if self.window_feat_dim > 0:
+                m = torch.cat([m, last_wf], dim=-1)           # [B, H + wf]
+            return self.mitre_head(m)
+        return self.mitre_head(binary_summary)
 
     def encode_batch(self, collated: dict) -> torch.Tensor:
         """Per-timestep embeddings for a collated batch: [B, T_max, D].
@@ -145,8 +215,25 @@ class WorldModel(nn.Module):
         comes from its own last valid timestep and never from padding.
         """
         seq_inputs = self.encode_batch(collated)              # [B, T_max, D]
-        summary = self.lstm(seq_inputs, lengths=collated["seq_lengths"])  # [B, H]
-        return self.attack_head(summary), self.mitre_head(summary)
+        lengths = collated["seq_lengths"]
+        summary = self.lstm(seq_inputs, lengths=lengths)      # [B, H]
+        attack_logits = self.attack_head(summary)
+        last_wf = self._last_window_features(collated)        # [B, wf]
+        mitre_logits = self._mitre_logits(seq_inputs, summary, last_wf, lengths)
+        return attack_logits, mitre_logits
+
+    def _last_window_features(self, collated: dict) -> torch.Tensor:
+        """Each sequence's TARGET (last valid) window features -> [B, wf].
+
+        Graph id for sequence b, timestep t is b*T_max + t, so the last valid
+        window is at b*T_max + (seq_lengths[b]-1). Only used by dual_lstm.
+        """
+        wf = collated["graph_window_features"]                # [B*T_max, wf]
+        T_max = int(collated["T_max"])
+        lengths = collated["seq_lengths"]
+        B = int(lengths.size(0))
+        idx = torch.arange(B) * T_max + (lengths - 1)
+        return wf[idx.to(wf.device)]
 
     def logits(self, windows: list[GraphWindow]) -> tuple[torch.Tensor, torch.Tensor]:
         """Raw (attack_logits [1,1], mitre_logits [1,num_stages]) for loss computation.
@@ -154,8 +241,11 @@ class WorldModel(nn.Module):
         Training needs logits, not the probabilities `forward` returns; exposing
         them here removes the duplicated encoder that used to live in train.py.
         """
-        summary_state = self.encode(windows)
-        return self.attack_head(summary_state), self.mitre_head(summary_state)
+        seq_tensor, last_wf = self._build_seq_single(windows)
+        summary_state = self.lstm(seq_tensor)
+        attack_logits = self.attack_head(summary_state)
+        mitre_logits = self._mitre_logits(seq_tensor, summary_state, last_wf, None)
+        return attack_logits, mitre_logits
 
     def forward(self, windows: list[GraphWindow]) -> PredictionResult:
         """
@@ -174,9 +264,10 @@ class WorldModel(nn.Module):
         PredictionResult
             A typed pydantic object mapping the final outputs.
         """
-        summary_state = self.encode(windows)
+        seq_tensor, last_wf = self._build_seq_single(windows)
+        summary_state = self.lstm(seq_tensor)
         attack_logits = self.attack_head(summary_state)  # [1, 1]
-        mitre_logits = self.mitre_head(summary_state)    # [1, num_mitre_stages]
+        mitre_logits = self._mitre_logits(seq_tensor, summary_state, last_wf, None)  # [1, S]
 
         # Activations
         attack_prob = torch.sigmoid(attack_logits).squeeze().item()
