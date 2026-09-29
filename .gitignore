@@ -39,6 +39,7 @@ venv/
 
 # Project Specific (Sentinel AI)
 backend/checkpoints/
+backend/.cache/
 backend/data/raw/
 *.csv
 !backend/data/samples/mock_cicids.csv

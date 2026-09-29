@@ -267,7 +267,7 @@ def make_blocked_folds(day_pools, n_splits=5, block_size=None):
         raise ValueError(
             f"No day has at least block_size={block_size} sequences (longest is "
             f"{longest}). Use --protocol lodo, lower --block-size, or train on "
-            f"more rows per day (the *_plus.csv files are ~7x the slices)."
+            f"more rows per day (raise or drop --max-rows)."
         )
     skipped = set(day_pools) - set(usable)
     if skipped:
@@ -626,7 +626,17 @@ def evaluate_loss(model, sequences, targets, attack_criterion, mitre_criterion, 
             total += loss.item()
     return total / max(len(sequences), 1)
 
-def evaluate(model, sequences, targets, threshold=0.5):
+def evaluate(model, sequences, targets, threshold=0.5, stage_clf=None):
+    """Evaluate the detector; optionally take stage predictions from an RF.
+
+    stage_clf: when None (default, --stage-classifier deep) the MITRE stage is
+    the deep head's argmax over attack stages, unchanged. When a fitted
+    StageClassifier is passed (--stage-classifier rf) the BINARY detection path
+    is untouched — still the GAT+LSTM sigmoid below — and only the stage
+    prediction is replaced by the RF's, read from the target window's 21
+    window_features. This keeps the two stage sources a clean ablation over the
+    identical binary decisions.
+    """
     model.eval()
     device = next(model.parameters()).device
     y_true_attack, y_pred_attack_probs = [], []
@@ -645,15 +655,21 @@ def evaluate(model, sequences, targets, threshold=0.5):
             y_pred_attack_probs.append(torch.sigmoid(attack_logits).squeeze().item())
 
             y_true_mitre.append(mitre_idx)
-            # Pick among ATTACK stages, skipping BENIGN at index 0.
-            #
-            # The stage head is trained on attack windows only, so its BENIGN
-            # logit is never supervised and is meaningless. Including it in the
-            # argmax let an unsupervised logit win and be scored as a wrong
-            # stage. The binary head answers "is this an attack"; this answers
-            # "which stage, given that it is".
-            probs = torch.softmax(mitre_logits, dim=-1).squeeze(0).tolist()
-            pred_mitre_idx = 1 + max(range(len(probs) - 1), key=lambda i: probs[i + 1])
+            if stage_clf is not None:
+                # RF stage prediction from the target window's 21 features. The
+                # detection path above is unchanged; only the stage source is.
+                feats = seq[-1].window_features
+                pred_mitre_idx = int(stage_clf.predict([list(feats)])[0])
+            else:
+                # Pick among ATTACK stages, skipping BENIGN at index 0.
+                #
+                # The stage head is trained on attack windows only, so its BENIGN
+                # logit is never supervised and is meaningless. Including it in the
+                # argmax let an unsupervised logit win and be scored as a wrong
+                # stage. The binary head answers "is this an attack"; this answers
+                # "which stage, given that it is".
+                probs = torch.softmax(mitre_logits, dim=-1).squeeze(0).tolist()
+                pred_mitre_idx = 1 + max(range(len(probs) - 1), key=lambda i: probs[i + 1])
             y_pred_mitre.append(pred_mitre_idx)
             
     import numpy as np
@@ -700,7 +716,11 @@ def run_pipeline(
     block_size: int | None = None,
     mitre_class_weights: bool = True,
     label_policy: str = "dominant",
-    only_fold: str | None = None
+    only_fold: str | None = None,
+    fixed_threshold: float | None = None,
+    stage2_mitre: bool = False,
+    mitre_arch: str = "mlp",
+    stage_classifier: str = "deep",
 ) -> tuple[WorldModel, dict, list, list, list, dict, dict]:
     """
     End-to-end data ingestion, sequence building, and model training.
@@ -720,7 +740,7 @@ def run_pipeline(
         logger.info(f"Parsed {len(events)} valid events, {len(errors)} errors skipped.")
         if max_rows is not None and len(events) > max_rows:
             # Truncation is chronological (events carry row-order timestamps), so the
-            # windowing and sequencing below behave exactly as on the full slice.
+            # windowing and sequencing below behave exactly as on the untruncated file.
             events = events[:max_rows]
             logger.info(f"Truncated to first {max_rows} events (--max-rows)")
         if not events:
@@ -794,14 +814,18 @@ def run_pipeline(
         lstm_dropout=0.1,
         num_mitre_stages=config.NUM_MITRE_STAGES,
         window_feat_dim=config.NUM_FEATURES if use_window_features else 0,
+        mitre_arch=mitre_arch,
     )
-    
+
     all_days = list(day_pools.keys())
 
     if protocol == "blocked":
         folds = list(make_blocked_folds(day_pools, n_splits=n_splits, block_size=block_size))
     else:
         folds = list(make_lodo_folds(day_pools, val_fraction=val_fraction))
+
+    if fixed_threshold is not None:
+        logger.info(f"Using fixed threshold: {fixed_threshold}")
 
     if only_fold is not None:
         names = [n for n, *_ in folds]
@@ -970,11 +994,40 @@ def run_pipeline(
             model.load_state_dict(best_state)
             logger.info(f"[Fold {test_day}] Restored best-validation weights (val loss {best_val:.4f})")
 
-        threshold = select_threshold(model, val_seqs_f, val_targets_f)
-        logger.info(f"[Fold {test_day}] Decision threshold from validation: {threshold:.2f}")
+        if fixed_threshold is not None:
+            # Under LODO the validation day is a different attack family than the
+            # test day, so a validation-tuned threshold does not transfer; a
+            # fixed threshold is more reliable (see docs). The banner is logged
+            # once, before the fold loop.
+            threshold = fixed_threshold
+        else:
+            threshold = select_threshold(model, val_seqs_f, val_targets_f)
+            logger.info(f"[Fold {test_day}] Decision threshold from validation: {threshold:.2f}")
 
-        metrics = evaluate(model, test_seqs_f, test_targets_f, threshold=threshold)
+        # --stage-classifier {lgbm,rf}: fit a tree ensemble on THIS fold's
+        # training attack windows (leak-free, since the fold's train set is
+        # already purged of anything overlapping the test block) and hand it to
+        # evaluate() to source stage predictions. Binary detection is untouched.
+        # Deep stays the ablation baseline. Fitting per fold rather than loading
+        # one global model is what keeps the reported stage numbers honest. The
+        # models train on the natural class distribution (the honest baseline).
+        stage_clf = None
+        if stage_classifier != "deep":
+            from app.stage_classifier import StageClassifier, attack_xy, MODEL_LABELS
+            X_tr, y_tr = attack_xy(list(zip(train_seqs_f, train_targets_f)))
+            if len(X_tr) == 0:
+                logger.warning(f"[Fold {test_day}] --stage-classifier {stage_classifier}: no "
+                               f"training attack windows; falling back to the deep stage head")
+            else:
+                stage_clf = StageClassifier(model=stage_classifier, class_weight=None).fit(X_tr, y_tr)
+                logger.info(f"[Fold {test_day}] Stage source: {MODEL_LABELS[stage_classifier]} "
+                            f"fit on {len(X_tr)} training attack windows "
+                            f"(stages {sorted(set(int(v) for v in y_tr))}); "
+                            f"binary detection unchanged (GAT+LSTM)")
+
+        metrics = evaluate(model, test_seqs_f, test_targets_f, threshold=threshold, stage_clf=stage_clf)
         metrics['decision_threshold'] = threshold
+        metrics['stage_classifier'] = stage_classifier
         logger.info(f"[Fold {test_day}] Test metrics: {json.dumps(metrics, default=str)}")
         fold_results.append((test_day, metrics))
 
@@ -992,6 +1045,106 @@ def run_pipeline(
             results_path.write_text(json.dumps(merged, indent=2))
             logger.info(f"[Fold {test_day}] Saved {fold_ckpt.name}, {fold_json.name} "
                         f"({len(merged)} fold(s) recorded)")
+
+            if stage2_mitre:
+                logger.info(f"\n[Fold {test_day}] Starting Stage 2: MITRE Head Only")
+                
+                # Load backbone (gat + lstm + attack_head) from Stage-1 checkpoint.
+                # mitre_head keys differ between old linear checkpoints and the new
+                # MLP architecture (mitre_head.weight vs mitre_head.0.weight), so we
+                # load with strict=False and then explicitly verify backbone keys loaded.
+                s1_state = torch.load(fold_ckpt, map_location=device, weights_only=True)
+                missing, unexpected = model.load_state_dict(s1_state, strict=False)
+                backbone_keys = {k for k in model.state_dict() if k.startswith("gat.") or k.startswith("lstm.") or k.startswith("attack_head.")}
+                missed_backbone = [k for k in missing if k in backbone_keys]
+                if missed_backbone:
+                    logger.error(f"[Fold {test_day}] Stage 2: backbone keys missing from Stage-1 checkpoint: {missed_backbone}")
+                    sys.exit(1)
+                logger.info(f"[Fold {test_day}] Stage 2 ({mitre_arch}): loaded Stage-1 backbone; "
+                            f"mitre head re-initialised fresh. Skipped keys: {[k for k in missing if k not in backbone_keys]}")
+
+                # Snapshot the frozen backbone (gat + lstm_binary + attack_head)
+                # to prove Stage 2 leaves detection bit-identical.
+                gat_weights_before = {k: v.clone() for k, v in model.gat.state_dict().items()}
+                lstm_weights_before = {k: v.clone() for k, v in model.lstm.state_dict().items()}
+                attack_weights_before = {k: v.clone() for k, v in model.attack_head.state_dict().items()}
+
+                for param in model.gat.parameters():
+                    param.requires_grad = False
+                for param in model.lstm.parameters():
+                    param.requires_grad = False
+                for param in model.attack_head.parameters():
+                    param.requires_grad = False
+
+                # Train the MITRE head, plus lstm_mitre when the dual_lstm arch
+                # has one. Selecting by requires_grad picks up whatever the arch
+                # left trainable without hardcoding module names.
+                trainable_s2 = [p for p in model.parameters() if p.requires_grad]
+                optimizer_s2 = optim.Adam(trainable_s2, lr=3e-4)
+                logger.info(f"[Fold {test_day}] Stage 2: training {sum(p.numel() for p in trainable_s2)} params "
+                            f"({'lstm_mitre + mitre_head' if hasattr(model, 'lstm_mitre') else 'mitre_head'})")
+                
+                if mitre_class_weights:
+                    counts_s2 = np.bincount([t[1] for t in train_targets_f if t[0] == 1], minlength=config.NUM_MITRE_STAGES).astype(np.float64)
+                    present_s2 = counts_s2 > 0
+                    w_s2 = np.ones_like(counts_s2)
+                    w_s2[present_s2] = counts_s2[present_s2].sum() / (present_s2.sum() * counts_s2[present_s2])
+                    w_s2 = np.clip(w_s2, a_min=None, a_max=5.0)
+                    mitre_criterion_s2 = nn.CrossEntropyLoss(weight=torch.tensor(w_s2, dtype=torch.float32, device=device))
+                    logger.info(f"[Fold {test_day}] Stage 2 MITRE class weights (capped at 5.0): " + ", ".join(f"{_stages[i].value}={w_s2[i]:.2f}" for i in range(len(w_s2)) if present_s2[i]))
+                else:
+                    mitre_criterion_s2 = nn.CrossEntropyLoss()
+                    
+                EPOCHS_S2 = 15
+                for epoch_s2 in range(1, EPOCHS_S2 + 1):
+                    model.train()
+                    total_loss_s2 = 0.0
+                    optimizer_s2.zero_grad()
+                    
+                    for i, (seq, (is_attack, mitre_idx)) in enumerate(zip(train_seqs_f, train_targets_f)):
+                        collated = collate_sequences([(seq, (is_attack, mitre_idx))], device)
+                        attack_logits, mitre_logits = model.logits_batch(collated)
+                        
+                        if is_attack == 1:
+                            loss = mitre_criterion_s2(mitre_logits.squeeze(0), torch.tensor(mitre_idx, device=device))
+                            loss = loss / ACCUM_STEPS
+                            loss.backward()
+                            total_loss_s2 += (loss.item() * ACCUM_STEPS)
+                            
+                        if (i + 1) % ACCUM_STEPS == 0 or (i + 1) == len(train_seqs_f):
+                            optimizer_s2.step()
+                            optimizer_s2.zero_grad()
+                            
+                    num_attacks_train = sum(1 for t in train_targets_f if t[0] == 1)
+                    avg_loss_s2 = total_loss_s2 / max(num_attacks_train, 1)
+                    logger.info(f"[Fold {test_day}] Stage 2 Epoch {epoch_s2}/{EPOCHS_S2} - MITRE Loss: {avg_loss_s2:.4f}")
+                    
+                gat_identical = all(torch.equal(gat_weights_before[k], v) for k, v in model.gat.state_dict().items())
+                lstm_identical = all(torch.equal(lstm_weights_before[k], v) for k, v in model.lstm.state_dict().items())
+                attack_identical = all(torch.equal(attack_weights_before[k], v) for k, v in model.attack_head.state_dict().items())
+                if not (gat_identical and lstm_identical and attack_identical):
+                    logger.error(f"[Fold {test_day}] Stage 2 leaked gradients into the detection backbone! "
+                                 f"gat={gat_identical}, lstm_binary={lstm_identical}, attack_head={attack_identical}")
+                    sys.exit(1)
+                logger.info(f"[Fold {test_day}] Verified detection backbone (gat + lstm_binary + attack_head) "
+                            f"bit-identical before/after Stage 2")
+                    
+                metrics_s2 = evaluate(model, test_seqs_f, test_targets_f, threshold=threshold)
+                metrics_s2['decision_threshold'] = threshold
+                
+                if 'mitre_f1_per_stage' in metrics_s2:
+                    logger.info(f"[Fold {test_day}] Stage 2 MITRE per-stage F1:")
+                    for stage_name, stage_stats in metrics_s2['mitre_f1_per_stage'].items():
+                        logger.info(f"  {stage_name:25} | F1: {stage_stats['f1']:.4f} | Support: {stage_stats['support']}")
+                        
+                fold_ckpt_s2 = ckpt_dir / f"lodo_fold_{test_day}_2stage.pt"
+                torch.save(model.state_dict(), fold_ckpt_s2)
+                logger.info(f"[Fold {test_day}] Saved Stage 2 checkpoint: {fold_ckpt_s2.name}")
+                
+                fold_results[-1] = (test_day, metrics_s2)
+                
+                fold_json_s2 = ckpt_dir / f"fold_{test_day}_2stage.json"
+                fold_json_s2.write_text(json.dumps(json.loads(json.dumps(metrics_s2, default=str)), indent=2))
 
     # Aggregate
     logger.info("\n" + "="*70 + "\nAGGREGATE\n" + "="*70)
@@ -1067,7 +1220,7 @@ def main():
     parser.add_argument("--resume-folds", action="store_true",
                         help="Skip folds already recorded as <save-path>/fold_<name>.json")
     parser.add_argument("--data-dir", type=str, default="data/raw",
-                        help="Directory holding the *_slice CSVs")
+                        help="Directory holding the five *_plus.csv day files")
     parser.add_argument("--max-rows", type=int, default=None,
                         help="Use only the first N rows of each day (fast experiments)")
     parser.add_argument("--no-window-features", action="store_true",
@@ -1100,10 +1253,31 @@ def main():
     parser.add_argument("--scaling", choices=["linear", "log"], default=None,
                         help="Feature scaling mode (default: config.FEATURE_SCALING). "
                              "linear won on aggregate ROC-AUC; log wins on low-volume attacks")
+    parser.add_argument("--fixed-threshold", type=float, default=None,
+                        help="Use this decision threshold for every fold instead of "
+                             "tuning one per fold on the validation day. Under LODO the "
+                             "validation day is a different attack family than the test "
+                             "day, so a tuned threshold does not transfer; 0.5 is usually "
+                             "more reliable. Omit to keep per-fold tuning.")
     parser.add_argument("--label-policy", choices=["dominant", "advanced"], default="dominant",
                         help="Window stage label: 'dominant' = most frequent attack; "
                              "'advanced' = furthest along the kill chain (recovers "
                              "Initial Access and Lateral Movement, loses Reconnaissance)")
+    parser.add_argument("--stage2-mitre", action="store_true",
+                        help="Run a frozen-backbone second stage training only the MITRE head")
+    parser.add_argument("--stage-classifier", choices=["deep", "rf", "lgbm"], default="lgbm",
+                        help="Source of the MITRE stage prediction. 'lgbm' (default, the "
+                             "selected deployment model) and 'rf' are tree ensembles on the 21 "
+                             "window features, fit per fold on that fold's training attack "
+                             "windows; binary detection still runs the deep GAT+LSTM unchanged. "
+                             "'deep' = the GAT+LSTM stage head (ablation baseline). LightGBM was "
+                             "chosen for the best C2 F1 (0.872) and lowest cross-fold variance; "
+                             "rf is kept for the ablation comparison.")
+    parser.add_argument("--mitre-arch", choices=["linear", "mlp", "dual_lstm"], default="mlp",
+                        help="MITRE head architecture. 'mlp' (default) = 2-layer MLP on the "
+                             "binary LSTM summary; 'linear' = single linear layer; 'dual_lstm' = "
+                             "a separate trainable LSTM on the frozen GAT embeddings + a raw "
+                             "window-feature skip. Must match the checkpoint when loading.")
     args = parser.parse_args()
 
     if args.threads:
@@ -1123,19 +1297,20 @@ def main():
     global dry_run
     dry_run = args.dry_run
     
-    # Paths to real data slices
+    # The five full-day CIC-IDS-2017 files. --max-rows truncates them for fast
+    # experiments; it does so AFTER parsing, so it saves training time, not parse time.
     data_dir = Path(args.data_dir)
     csv_paths = [
-        data_dir / "monday_plus_slice.csv",
-        data_dir / "tuesday_plus_slice.csv",
-        data_dir / "wednesday_plus_slice.csv",
-        data_dir / "thursday_plus_slice.csv",
-        data_dir / "friday_plus_slice_mixed.csv",
+        data_dir / "monday_plus.csv",
+        data_dir / "tuesday_plus.csv",
+        data_dir / "wednesday_plus.csv",
+        data_dir / "thursday_plus.csv",
+        data_dir / "friday_plus.csv",
     ]
 
     missing = [p for p in csv_paths if not p.exists()]
     if missing and not args.smoke:
-        logger.error("Missing data slices (cwd must be the backend/ directory):")
+        logger.error("Missing data files (cwd must be the backend/ directory):")
         for p in missing:
             logger.error(f"  {p.resolve()}")
         sys.exit(1)
@@ -1214,7 +1389,7 @@ def main():
             logger.error("Reload check FAILED.")
             
     else:
-        logger.info("Running real data pipeline with combined slices...")
+        logger.info("Running real data pipeline over the five full-day files...")
         model, model_args, train_seqs, test_seqs, test_targets, train_metrics, test_metrics = run_pipeline(
             csv_paths, is_smoke=False, epochs=args.epochs, save_path=args.save_path,
             resume_from=args.resume_from, device=args.device, resume_folds=args.resume_folds,
@@ -1223,7 +1398,9 @@ def main():
             val_fraction=args.val_fraction, pos_weight_mode=args.pos_weight,
             protocol=args.protocol, n_splits=args.n_splits, block_size=args.block_size,
             mitre_class_weights=not args.no_mitre_class_weights,
-            label_policy=args.label_policy, only_fold=args.only_fold
+            label_policy=args.label_policy, only_fold=args.only_fold,
+            fixed_threshold=args.fixed_threshold, stage2_mitre=args.stage2_mitre,
+            mitre_arch=args.mitre_arch, stage_classifier=args.stage_classifier
         )
 
         if model is None:
