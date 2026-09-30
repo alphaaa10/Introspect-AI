@@ -299,3 +299,43 @@ class WorldModel(nn.Module):
             attention_weights=attn_list,
             source=windows[-1].source,
         )
+
+    @torch.no_grad()
+    def attention_for_sequence(self, sequence, top_k: int = 5) -> list[dict]:
+        """Top-K attended edges per window — read-only extraction of GAT attention.
+
+        The GAT already computes per-edge attention during its forward pass and
+        stores it in ``gat.latest_attention_weights`` as ``[E, num_heads]`` (a
+        softmax over incoming edges per destination node, so weights sum to 1 per
+        node). This re-runs the encoder per window on the single-graph path purely
+        to read that tensor back out; it does NOT modify the forward pass and does
+        NOT touch the detection path. Heads are averaged, then the highest-weight
+        edges are mapped to (src_ip, dst_ip) through the window's own edge list
+        (edge row j corresponds to ``window.edges[j]``).
+
+        Returns a list aligned with ``sequence``:
+            ``[{"window_id", "top_edges": [{"src","dst","weight"}, ...]}, ...]``
+
+        Attention is per-window and order-independent, so callers may pass any set
+        of windows (e.g. just the alert windows). Call in eval mode so attention
+        dropout is disabled and the per-node weights sum to exactly 1.
+        """
+        from app.graph.converter import window_to_tensors
+
+        device = next(self.parameters()).device
+        out: list[dict] = []
+        for gw in sequence:
+            x, edge_index, edge_attr = window_to_tensors(gw, device=device)
+            # Populate gat.latest_attention_weights for THIS window.
+            self.gat(x, edge_index, edge_attr)
+            alpha = self.gat.latest_attention_weights  # [E, num_heads] or empty
+            edges: list[dict] = []
+            if alpha is not None and alpha.numel() > 0 and gw.edges:
+                w = alpha.mean(dim=1).detach().cpu().tolist()  # average heads -> [E]
+                m = min(len(w), len(gw.edges))
+                paired = [(gw.edges[j].src_ip, gw.edges[j].dst_ip, float(w[j])) for j in range(m)]
+                paired.sort(key=lambda t: t[2], reverse=True)
+                edges = [{"src": s, "dst": d, "weight": round(wt, 4)}
+                         for s, d, wt in paired[:top_k]]
+            out.append({"window_id": gw.window_id, "top_edges": edges})
+        return out

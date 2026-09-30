@@ -118,6 +118,24 @@ def _attack_profile(ctx, stage_names):
     }
 
 
+def _build_alerts(ctx, max_alerts=12, top_k=5):
+    """Per-alert-window top-K GAT-attended edges (read-only extraction)."""
+    attack = [r for r in ctx.results if r.is_attack]
+    if not attack or ctx.model is None:
+        return []
+    strongest = sorted(attack, key=lambda r: r.attack_prob, reverse=True)[:max_alerts]
+    seq = [ctx.windows[r.index] for r in strongest]
+    att = ctx.model.attention_for_sequence(seq, top_k=top_k)
+    alerts = [{
+        "window_id": r.window_id,
+        "attack_probability": round(r.attack_prob, 4),
+        "predicted_stage": r.stage,
+        "top_attended_edges": a["top_edges"],
+    } for r, a in zip(strongest, att)]
+    alerts.sort(key=lambda x: x["window_id"])  # chronological (zero-padded ids)
+    return alerts
+
+
 def build_scenario(ctx) -> dict:
     mitre = build_mitre_stages(ctx)
     gv = build_graph_view(ctx)
@@ -125,6 +143,7 @@ def build_scenario(ctx) -> dict:
 
     expl = build_explainability(ctx)
     narr = build_narrative(ctx)
+    alerts = _build_alerts(ctx)
 
     return {
         "name": f"Uploaded analysis — {ctx.n_events:,} flows, "
@@ -143,4 +162,5 @@ def build_scenario(ctx) -> dict:
         "rawLogStream": narr["rawLogStream"],
         "graphNodes": gv["graphNodes"],
         "graphEdges": gv["graphEdges"],
+        "alerts": alerts,
     }

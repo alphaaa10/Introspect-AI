@@ -49,6 +49,7 @@ export default function DetectionTimeline({ data, onMaximize, isMaximized }) {
   }, [timeRange, data.urgencyTimeline]);
 
   const detections = data.detections || [];
+  const alerts = data.alerts || [];
 
   return (
     <div style={{ height: '100%', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
@@ -208,6 +209,52 @@ export default function DetectionTimeline({ data, onMaximize, isMaximized }) {
             </tbody>
           </table>
         </div>
+
+        {/* ── Attention attribution (GAT) ── */}
+        {alerts.length > 0 && (
+          <div style={{ padding: 'var(--space-4)', borderTop: '1px solid var(--surface-border)' }}>
+            <div style={{ fontSize: 'var(--text-sm)', fontWeight: 700 }}>Attention attribution (GAT)</div>
+            <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)', marginBottom: 'var(--space-3)' }}>
+              Top-5 attended edges per alert window — attention is a softmax over incoming edges per node
+            </div>
+
+            {alerts.map((al) => (
+              <div key={al.window_id} style={{ marginBottom: 'var(--space-3)' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+                  <span style={{ padding: '1px 8px', borderRadius: 999, fontSize: 10, fontWeight: 700,
+                                 background: 'color-mix(in srgb, var(--severity-critical) 15%, transparent)',
+                                 color: 'var(--severity-critical)' }}>
+                    {al.predicted_stage}
+                  </span>
+                  <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text-secondary)' }}>
+                    {al.window_id}
+                  </span>
+                  <span style={{ marginLeft: 'auto', fontFamily: 'var(--font-mono)', fontSize: 11,
+                                 fontWeight: 700, color: 'var(--severity-critical)' }}>
+                    P={Math.round(al.attack_probability * 100)}%
+                  </span>
+                </div>
+
+                {al.top_attended_edges.length > 0 ? al.top_attended_edges.map((e, i) => (
+                  <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 11, marginTop: 3 }}>
+                    <span style={{ flex: 1, minWidth: 0, fontFamily: 'var(--font-mono)', whiteSpace: 'nowrap',
+                                   overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                      {e.src} → {e.dst}
+                    </span>
+                    <div style={{ flex: 1, height: 6, background: 'var(--bg-tertiary)', borderRadius: 3, overflow: 'hidden' }}>
+                      <div style={{ width: `${Math.min(100, e.weight * 100)}%`, height: '100%', background: 'var(--accent-primary)' }} />
+                    </div>
+                    <span style={{ width: 46, textAlign: 'right', fontFamily: 'var(--font-mono)', color: 'var(--text-secondary)' }}>
+                      {e.weight.toFixed(3)}
+                    </span>
+                  </div>
+                )) : (
+                  <div style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>No edges (single-node window)</div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
       </div>
     </div>
   );

@@ -100,6 +100,7 @@ class AnalysisContext:
     threshold: float
     stage_clf: object
     n_events: int
+    model: object = None          # WorldModel, for read-only GAT attention extraction
     truncated: bool = False
     meta: dict = field(default_factory=dict)
 
@@ -170,5 +171,5 @@ def analyze_csv(
     return AnalysisContext(
         events=events, windows=windows, results=results, coverage=coverage,
         threshold=threshold, stage_clf=stage_clf, n_events=len(events),
-        truncated=truncated,
+        model=model, truncated=truncated,
     )
