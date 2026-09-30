@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app import config
 from app.schemas import HealthResponse
+from app.api.routes.analyze import router as analyze_router
 
 LOG_LEVEL = os.environ.get("SENTINEL_LOG_LEVEL", "INFO")
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
@@ -33,6 +34,9 @@ app.add_middleware(
 @app.get("/health", response_model=HealthResponse)
 def health() -> HealthResponse:
     return HealthResponse(status="ok", service="sentinel-backend")
+
+# Upload -> analyze pipeline (POST /api/analyze).
+app.include_router(analyze_router)
 
 if __name__ == "__main__":
     import uvicorn

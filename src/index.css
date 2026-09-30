@@ -1469,3 +1469,7 @@ input:focus {
     min-height: 280px;
   }
 }
+
+/* Upload spinner (SetupScreen analyze button) */
+@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+.spin { animation: spin 0.9s linear infinite; }

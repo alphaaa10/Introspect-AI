@@ -1,85 +1,107 @@
-import { useState, useEffect } from 'react';
+import { useState, useRef } from 'react';
 import { LogoIcon } from './Icons';
-import { UploadCloud, Database, ShieldAlert, FileText, Share2, Server, Network, UserX } from 'lucide-react';
+import { UploadCloud, Database, Server, Network, UserX,
+         CheckCircle2, AlertTriangle, Loader2, FileUp } from 'lucide-react';
+import { analyzeLogs } from '../api/client';
 
 export default function SetupScreen({ onComplete, initialMode = null }) {
   const [mode, setMode] = useState(initialMode);
-  const [showOfflineToast, setShowOfflineToast] = useState(false);
-
-  useEffect(() => {
-    if (mode === 'upload') {
-      setShowOfflineToast(true);
-      const timer = setTimeout(() => setShowOfflineToast(false), 4000);
-      return () => clearTimeout(timer);
-    }
-  }, [mode]);
+  const [file, setFile] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const [coverage, setCoverage] = useState(null); // report on refusal or success
+  const fileInputRef = useRef(null);
 
   const handleDatasetSelect = (datasetKey) => {
     onComplete(datasetKey);
   };
 
-  const handleUploadComplete = () => {
-    onComplete('upload');
+  const handleUploadComplete = async () => {
+    if (!file) { setError('Choose a flow-log CSV first.'); return; }
+    setLoading(true); setError(null); setCoverage(null);
+    const res = await analyzeLogs(file);
+    setLoading(false);
+    if (res.ok) {
+      onComplete('upload', res.data);          // hand the analyzed scenario to App
+    } else {
+      setError(res.error);
+      if (res.coverage) setCoverage(res.coverage); // 422: show what's missing
+    }
   };
 
   if (mode === 'upload') {
+    const isRefusal = coverage && coverage.ok === false;
     return (
       <div className="setup-container">
-        {showOfflineToast && (
-          <div className="offline-toast" style={{ top: 20, position: 'absolute' }}>
-            <ShieldAlert size={14} />
-            This feature is unavailable in offline / simulation mode
-          </div>
-        )}
         <div className="setup-logo" style={{ marginBottom: 'var(--space-6)' }}>
           <div className="setup-logo-icon" style={{ width: 48, height: 48 }}>
             <LogoIcon size={24} />
           </div>
-          <h2 style={{ fontSize: '1.5rem', fontWeight: 800 }}>Upload Enterprise Logs</h2>
-          <p style={{ color: 'var(--text-secondary)' }}>Provide CSV or JSON logs for the correlation engine</p>
+          <h2 style={{ fontSize: '1.5rem', fontWeight: 800 }}>Upload Flow Logs</h2>
+          <p style={{ color: 'var(--text-secondary)' }}>
+            CIC-IDS-2017 / CICFlowMeter CSV. The world model + LightGBM stage classifier run on your file.
+          </p>
         </div>
 
         <div className="solid-panel" style={{ width: '100%', maxWidth: 600, padding: 'var(--space-6)' }}>
-          
-          <div className="dropzone">
-            <ShieldAlert size={32} color="var(--severity-critical)" style={{ marginBottom: 12 }} />
-            <h4 style={{ fontWeight: 600, marginBottom: 4 }}>1. Attack Logs (Required)</h4>
-            <p style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)' }}>IDS alerts, firewall blocks, or EDR detections</p>
-            <button className="primary-btn" style={{ background: 'var(--bg-tertiary)', color: 'var(--text-primary)', boxShadow: 'none' }}>
-              Browse Files
-            </button>
+          <input
+            ref={fileInputRef} type="file" accept=".csv,text/csv" style={{ display: 'none' }}
+            onChange={(e) => { setFile(e.target.files?.[0] || null); setError(null); setCoverage(null); }}
+          />
+
+          <div
+            className="dropzone"
+            onClick={() => fileInputRef.current?.click()}
+            onDragOver={(e) => e.preventDefault()}
+            onDrop={(e) => { e.preventDefault(); const f = e.dataTransfer.files?.[0]; if (f) { setFile(f); setError(null); setCoverage(null); } }}
+            style={{ cursor: 'pointer' }}
+          >
+            {file
+              ? <CheckCircle2 size={32} color="var(--accent-primary)" style={{ marginBottom: 12 }} />
+              : <FileUp size={32} color="var(--accent-primary)" style={{ marginBottom: 12 }} />}
+            <h4 style={{ fontWeight: 600, marginBottom: 4 }}>
+              {file ? file.name : 'Flow Logs (CSV) — Required'}
+            </h4>
+            <p style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)' }}>
+              {file ? `${(file.size / 1024 / 1024).toFixed(1)} MB — click to change`
+                    : 'Click to browse or drop a CICFlowMeter/CIC-IDS-2017 flow CSV'}
+            </p>
           </div>
 
-          <div className="dropzone">
-            <Share2 size={32} color="var(--accent-primary)" style={{ marginBottom: 12 }} />
-            <h4 style={{ fontWeight: 600, marginBottom: 4 }}>2. Relation Logs (Required)</h4>
-            <p style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)' }}>NetFlow, IPFIX, or proxy logs mapping connections</p>
-            <button className="primary-btn" style={{ background: 'var(--bg-tertiary)', color: 'var(--text-primary)', boxShadow: 'none' }}>
-              Browse Files
-            </button>
-          </div>
-
-          <div className="dropzone">
-            <FileText size={32} color="var(--text-secondary)" style={{ marginBottom: 12 }} />
-            <h4 style={{ fontWeight: 600, marginBottom: 4 }}>3. Context Logs (Optional)</h4>
-            <p style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)' }}>Active Directory, VPN auth, or host config logs</p>
-            <button className="primary-btn" style={{ background: 'var(--bg-tertiary)', color: 'var(--text-primary)', boxShadow: 'none' }}>
-              Browse Files
-            </button>
-          </div>
+          {/* Error / refusal */}
+          {error && (
+            <div style={{ marginTop: 'var(--space-4)', padding: 'var(--space-3)', borderRadius: 'var(--radius-md)',
+                          background: 'color-mix(in srgb, var(--severity-critical) 12%, transparent)',
+                          border: '1px solid var(--severity-critical)', display: 'flex', gap: 8, alignItems: 'flex-start' }}>
+              <AlertTriangle size={16} color="var(--severity-critical)" style={{ flexShrink: 0, marginTop: 2 }} />
+              <div style={{ fontSize: 'var(--text-sm)' }}>
+                <div style={{ fontWeight: 600 }}>{isRefusal ? 'Insufficient feature coverage' : 'Analysis failed'}</div>
+                <div style={{ color: 'var(--text-secondary)' }}>{error}</div>
+                {isRefusal && coverage?.missing?.length > 0 && (
+                  <ul style={{ margin: '6px 0 0 16px', color: 'var(--text-secondary)' }}>
+                    {coverage.missing.slice(0, 8).map((m) => <li key={m}>{m}</li>)}
+                  </ul>
+                )}
+              </div>
+            </div>
+          )}
 
           <div style={{ display: 'flex', gap: 'var(--space-4)', marginTop: 'var(--space-4)' }}>
-            <button 
-              onClick={() => setMode(null)}
+            <button
+              onClick={() => { setMode(null); setFile(null); setError(null); setCoverage(null); }}
+              disabled={loading}
               style={{ flex: 1, padding: 'var(--space-3)', background: 'var(--bg-tertiary)', borderRadius: 'var(--radius-md)', fontWeight: 600 }}
             >
               Back
             </button>
-            <button 
+            <button
               onClick={handleUploadComplete}
-              className="primary-btn" style={{ flex: 2, margin: 0 }}
+              disabled={loading || !file}
+              className="primary-btn"
+              style={{ flex: 2, margin: 0, opacity: (loading || !file) ? 0.6 : 1,
+                       display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8 }}
             >
-              Process Logs & Launch
+              {loading ? <><Loader2 size={16} className="spin" /> Analyzing…</> : 'Process Logs & Launch'}
             </button>
           </div>
         </div>

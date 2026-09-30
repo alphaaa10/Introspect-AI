@@ -32,6 +32,6 @@ lightgbm==4.7.0         # stage_classifier.py --model lgbm
 # shap==0.46.0
 
 # ── Phase 7 utilities ─────────────────────────────────────────
-# python-multipart==0.0.12   # file-upload endpoints
+python-multipart==0.0.12   # file-upload endpoints (POST /api/analyze)
 
 torch==2.4.1

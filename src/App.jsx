@@ -22,6 +22,7 @@ export default function App() {
   const [activeView, setActiveView] = useState('Overview');
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [currentScenarioKey, setCurrentScenarioKey] = useState('A_BRUTE_FORCE');
+  const [uploadedScenario, setUploadedScenario] = useState(null);
   const [maximizedComponent, setMaximizedComponent] = useState(null);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   
@@ -46,18 +47,24 @@ export default function App() {
     return (
       <>
         <div className="mesh-bg" />
-        <SetupScreen 
+        <SetupScreen
           initialMode={appState === 'select-dataset' ? 'select-dataset' : null}
-          onComplete={(datasetKey) => {
-            if (datasetKey !== 'upload') setCurrentScenarioKey(datasetKey);
+          onComplete={(datasetKey, payload) => {
+            if (datasetKey === 'upload' && payload?.scenario) {
+              setUploadedScenario(payload.scenario);
+              setCurrentScenarioKey('UPLOADED');
+            } else if (datasetKey !== 'upload') {
+              setCurrentScenarioKey(datasetKey);
+            }
             setAppState('dashboard');
-          }} 
+          }}
         />
       </>
     );
   }
 
-  const scenarioData = scenarios[currentScenarioKey] || scenarios['A_BRUTE_FORCE'];
+  const allScenarios = uploadedScenario ? { ...scenarios, UPLOADED: uploadedScenario } : scenarios;
+  const scenarioData = allScenarios[currentScenarioKey] || scenarios['A_BRUTE_FORCE'];
 
   const handleMaximize = (componentId) => {
     setMaximizedComponent(maximizedComponent === componentId ? null : componentId);
@@ -219,7 +226,7 @@ export default function App() {
   );
 
   return (
-    <ScenarioContext.Provider value={{ currentScenarioKey, setCurrentScenarioKey, scenarios, goHome: () => setAppState('select-dataset'), theme, toggleTheme }}>
+    <ScenarioContext.Provider value={{ currentScenarioKey, setCurrentScenarioKey, scenarios: allScenarios, goHome: () => setAppState('select-dataset'), theme, toggleTheme }}>
       <div className="mesh-bg" />
 
       <div className="app-layout">
