@@ -29,7 +29,7 @@ xgboost==3.4.1          # stage_classifier.py --model xgb
 lightgbm==4.7.0         # stage_classifier.py --model lgbm
 
 # ── Phase 4 (explainability) ──────────────────────────────────
-# shap==0.46.0
+shap==0.52.0            # real SHAP TreeExplainer on the LightGBM stage classifier
 
 # ── Phase 7 utilities ─────────────────────────────────────────
 python-multipart==0.0.12   # file-upload endpoints (POST /api/analyze)
