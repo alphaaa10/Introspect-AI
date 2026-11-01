@@ -179,7 +179,7 @@ export default function SetupScreen({ onComplete, initialMode = null }) {
           <div className="setup-card-icon">
             <Database size={24} />
           </div>
-          <h3>Start SIH Simulation</h3>
+          <h3>Start Simulation</h3>
           <p>Launch the dashboard with a pre-configured, realistic attack scenario spanning 15 minutes of network traffic.</p>
           <button className="primary-btn">Select Dataset</button>
         </div>
